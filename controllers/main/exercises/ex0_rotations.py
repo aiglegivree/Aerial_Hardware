@@ -14,28 +14,12 @@ def euler2rotmat(euler_angles):
     #           R: A 3x3 numpy array that represents the rotation matrix of the euler angles
 
     # --- YOUR CODE HERE ---
-
-    # R_roll = 
-    # R_pitch = 
-    # R_yaw = 
-
-    # R =
-
-    # --- SAMPLE SOLUTION ---
-    R_roll = np.array([[1, 0, 0],
-                       [0, np.cos(euler_angles[0]), -np.sin(euler_angles[0])],
-                       [0, np.sin(euler_angles[0]), np.cos(euler_angles[0])]])
-
-    R_pitch = np.array([[np.cos(euler_angles[1]), 0, np.sin(euler_angles[1])],
-                        [0, 1, 0],
-                        [-np.sin(euler_angles[1]), 0, np.cos(euler_angles[1])]])
-
-    R_yaw = np.array([[np.cos(euler_angles[2]), -np.sin(euler_angles[2]), 0],
-                      [np.sin(euler_angles[2]), np.cos(euler_angles[2]), 0],
-                      [0, 0, 1]])
+    roll, ptich, yaw = euler_angles
+    R_roll = np.array([[1.0, 0.0,0.0],[0.0, np.cos(roll), -np.sin(roll)],[0.0, np.sin(roll), np.cos(roll)]])
+    R_pitch = np.array([[np.cos(pitch), 0.0, np.sin(pitch)],[0.0,1.0,0.0],[-np.sin(pitch), 0.0, np.cos(pitch)]])
+    R_yaw = np.array([[np.cos(yaw), -np.sin(yaw), 0.0],[np.sin(yaw), np.cos(yaw), 0.0],[0.0,0.0,1.0]])
 
     R = R_yaw @ R_pitch @ R_roll
-
     return R
 
 
@@ -56,8 +40,8 @@ def rot_inertial2body(control_commands, euler_angles, quaternion):
 
     # --- YOUR CODE HERE ---
 
-    # vel_inertial = 
-    # R = 
+    vel_inertial = np.array([control_commands[0], control_commands[1]])
+    R = euler2rotmat(euler_angles)
     # vel_body = 
 
     # control_commands = 

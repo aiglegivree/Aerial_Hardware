@@ -3,3 +3,12 @@ sphinx_rtd_theme==1.1.1
 readthedocs-sphinx-search==0.1.1
 requests==2.28.1
 urllib3==1.26.12
+
+# -- Ajouts pour le calcul et l'affichage scientifique --
+numpy==1.23.5
+matplotlib==3.6.3
+scipy==1.10.1
+pandas==1.5.3
+opencv-python
+pyyaml
+scikit-learn
