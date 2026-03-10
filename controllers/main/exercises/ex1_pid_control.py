@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation as R
 class quadrotor_controller():
     def __init__(self, exp_num):
         # Exercise 1: Choose what to tune ["vel_z", "pos_z", "vel_xy", "pos_xy"]
-        self.tuning_level = "vel_z" #"off" to disable tuning
+        self.tuning_level = "off" #"off" to disable tuning
         
         ### START EXERCISE 1 tuning part ###
         # Only change the gains you are asked to, the others are already tuned by us (INITIAL GAINS)
