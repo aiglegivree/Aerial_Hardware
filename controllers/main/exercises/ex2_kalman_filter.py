@@ -21,7 +21,7 @@ class kalman_filter():
         self.use_direct_noisy_measurement = False # Enable this to test the drone response when the nosiy sensor measurement is used directly
         self.use_direct_ground_truth_measurement = True # Enable this to test the drone response when the ground truth state is used directly
         self.use_KF_measurement = False # Enable this to test the drone response when the Kalman Filter is used to estimate the state
-        self.use_accel_only = False # Enable this to test the drone response when only accelerometer measurements are used in the Kalman Filter (Part 2)
+        self.use_accel_only = True # Enable this to test the drone response when only accelerometer measurements are used in the Kalman Filter (Part 2)
 
         # Simulation time after which plots are generated
         self.plot_time_limit = 30.0
