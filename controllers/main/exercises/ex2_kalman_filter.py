@@ -12,7 +12,7 @@ class kalman_filter():
         self.noise_std_ACCEL = 0.05
 
         #Tuning parameter
-        self.q_tr = 0.7 #0.7 # Original: 1.0 #Best: 0.5
+        self.q_tr = 1.0 
 
         #Initialize KF state and model uncertainty
         self.initialize_KF(self.noise_std_GPS, self.noise_std_ACCEL)
@@ -74,7 +74,7 @@ class kalman_filter():
         #   noise_std_ACCEL: Standard deviation of Accelerometer noise
         # YOUR CODE HERE
         # -----------------------------------
-        self.X_opt = np.random.rand(9,1)*0.01 # Initialize the optimal state vector (n_states x 1) as a zero vector
+        self.X_opt = np.random.rand(9,1) # Initialize the optimal state vector (n_states x 1) as a zero vector
         self.P_opt = 100 * np.eye(9) 
 
         self.H_GPS = np.zeros((3,9))
@@ -151,7 +151,6 @@ class kalman_filter():
         # Use the KF update turle to obtain the optimal state estimate (self.X_opt) and optimal covariance (self.P_opt)
         self.X_opt = X_pred + K@(Z-H@X_pred)
         self.P_opt = (np.eye(9) - K@H)@P_pred
-        print(self.P_opt)
 
         return self.X_opt, self.P_opt
 
