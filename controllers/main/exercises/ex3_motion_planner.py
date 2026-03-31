@@ -62,9 +62,13 @@ class MotionPlanner3D():
 
         # YOUR SOLUTION HERE ---------------------------------------------------------------------------------- ## 
         
-        # A_m = np.array([
-        #     ...
-        # ])
+        A_m = np.array([
+             [1, t, t**2, t**3, t**4, t**5],
+             [0, 1, 2*t, 3*t**2, 4*t**3, 5*t**4],
+             [0, 0, 2, 6*t, 12*t**2, 20*t**3],
+             [0, 0, 0, 6, 24*t, 60*t**2],
+             [0, 0, 0, 0, 24, 120*t]
+         ])
 
         ## ---------------------------------------------------------------------------------------------------- ##
 
@@ -98,19 +102,41 @@ class MotionPlanner3D():
             for i in range(m-1):
                 pos_0 = pos[i] #Starting position of the segment
                 pos_f = pos[i+1] #Final position of the segment
+                #ici A_f est calculer pour la duree d'un segment et pas le temps absolu
                 A_f = self.compute_poly_matrix(seg_times[i]) # A_f gives the constraint factor matrix A_m for a segment i at its relative end time t=seg_times[i]
-                # if i == 0: # First path segment
-                #     # 1. Implement the initial constraints here for the first path segment using A_0, ensuring that the intiial velocities / accelerations are zero
-                #     # 2. Implement the final position and the continuity constraints for velocity, acceleration, jerk and snap at the end of the first segment here using A_0 and A_f (check hints in the exercise description)
-                # elif i < m-2: # Intermediate path segments
-                #     # 1. Similarly, implement the initial and final position constraints here for each intermediate path segment
-                #     # 2. Similarly, implement the end of the continuity constraints for velocity, acceleration, jerk and snap at the end of each intermediate segment here using A_0 and A_f
-                # elif i == m-2: #Final path segment
-                #     # 1. Implement the initial and final position, velocity and accelerations constraints here for the final path segment using A_0 and A_f
-        
+                if i == 0: # First path segment
+                    # 1. Implement the initial constraints here for the first path segment using A_0, ensuring that the intiial velocities / accelerations are zero
+                    A[0,0:6] = A_0[0,:] #initial constraint over position
+                    A[1,0:6] = A_0[1,:] #initial constraint over velocity
+                    A[2,0:6] = A_0[2,:] #initial constraint over acceleration
+                    b[0] = pos_0
+                    # 2. Implement the final position and the continuity constraints for velocity, acceleration, jerk and snap at the end of the first segment here using A_0 and A_f (check hints in the exercise description)
+                    A[3, 7:12] = A_f[0,:] #final constraint
+                    b[3] = pos_f
+                    A[4:8, 0:6] = A_f
+                    A[4:8, 7:12] = -A_0 #car au debut de cahque iteration A_0 resteras toujours le meme
+                elif i < m-2: # Intermediate path segments
+                    # 1. Similarly, implement the initial and final position constraints here for each intermediate path segment
+                    A[3+6*i, 6*i:6*(i+1)] = A_0[0,:]
+                    b[3+6*i] = pos_0
+                    A[4+6*i:8+6*i, 6*i:6*(i+1)] = A_f
+                    A[4+6*i:8+6*i, 6*(i+i):6*(i+2)] = -A_0
+                    b[4+6*i] = pos_f
+                    # 2. Similarly, implement the end of the continuity constraints for velocity, acceleration, jerk and snap at the end of each intermediate segment here using A_0 and A_f
+                elif i == m-2: #Final path segment
+                    # 1. Implement the initial and final position, velocity and accelerations constraints here for the final path segment using A_0 and A_f
+                    #####VERIFIER LES IDNEXATION EN i PAS SUR QUE CELA SOIT JUSTE
+                    A[3+6*i, 6*(i+i):6*(i+2)] = A_0[0,:]
+                    A[4+6*i, 6*(i+i):6*(i+2)] = A_0[1,:]
+                    A[5+6*i, 6*(i+i):6*(i+2)] = A_0[2,:]
+                    A[3+6*i, 6*i:6*(i+1)] = A_f[0,:]
+                    A[4+6*i, 6*i:6*(i+1)] = A_f[1,:]
+                    A[5+6*i, 6*i:6*(i+1)] = A_f[2,:]
+                    b[-3] = pos_f
+
             # Solve for the polynomial coefficients for the dimension dim
 
-            # poly_coeffs[:,dim] = ...
+            poly_coeffs[:,dim] = np.linalg.solve(A, b)
 
         ## ---------------------------------------------------------------------------------------------------- ##
 
