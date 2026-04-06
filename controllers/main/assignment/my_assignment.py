@@ -61,6 +61,9 @@ class MyAssignment:
 
         self.curr_gate_index = 0
 
+        self.racing_waypoints = []
+        self.racing_waypoint_index = 0
+
     def compute_command(self, sensor_data, camera_data, dt):
 
         # NOTE: Displaying the camera image with cv2.imshow() will throw an error because GUI operations should be performed in the main thread.
@@ -267,7 +270,61 @@ class MyAssignment:
         
         if self.state == COMPUTE_PATH:
             #PAS ECNORE FAITE
-            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']]
+            nbr_of_lap = 2
+            for lap in range(nbr_of_lap):
+                for gate_index in range(5):
+                    gate_x = self.gate_pos[gate_index, 0]
+                    gate_y = self.gate_pos[gate_index, 1]
+                    gate_z = self.gate_pos[gate_index, 2]
+                    gate_yaw = self.gate_pos[gate_index, 3]
+
+                    wp_app_x = gate_x - self.approach_distance * np.cos(gate_yaw)
+                    wp_app_y = gate_y - self.approach_distance * np.sin(gate_yaw)
+
+                    #before the gate
+                    self.racing_waypoints.append([wp_app_x, wp_app_y, gate_z, gate_yaw])
+                    #at the gate
+                    self.racing_waypoints.append([gate_x, gate_y, gate_z, gate_yaw])
+                    #after the gate
+                    wp_exit_x = gate_x + self.approach_distance * np.cos(gate_yaw)
+                    wp_exit_y = gate_y + self.approach_distance * np.sin(gate_yaw)
+                    self.racing_waypoints.append([wp_exit_x, wp_exit_y, gate_z, gate_yaw])
+
+            self.x_target = self.racing_waypoints[0][0]
+            self.y_target = self.racing_waypoints[0][1]
+            self.z_target = self.racing_waypoints[0][2]
+            self.yaw_target = self.racing_waypoints[0][3]
+            
+            self.state = RACE
+            print("Computed racing path, transitioning to RACE state")
+            control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
+
+        if self.state == RACE:
+            #PAS ENCORE FAITE
+            if self.racing_waypoint_index >= len(self.racing_waypoints):
+                control_command = [self.start_x, self.start_y, 1.0, self.start_yaw] # hover at the starting position after finishing
+            else:
+                #actual waypoint
+                self.x_target = self.racing_waypoints[self.racing_waypoint_index][0]
+                self.y_target = self.racing_waypoints[self.racing_waypoint_index][1]
+                self.z_target = self.racing_waypoints[self.racing_waypoint_index][2]
+                self.yaw_target = self.racing_waypoints[self.racing_waypoint_index][3]
+
+                distance = np.linalg.norm(np.array([
+                sensor_data['x_global'] - self.x_target, 
+                sensor_data['y_global'] - self.y_target, 
+                sensor_data['z_global'] - self.z_target
+                ]))
+
+                if distance < 0.4:
+                    self.racing_waypoint_index += 1
+                    if self.racing_waypoint_index < len(self.racing_waypoints):
+                        print(f"Reached waypoint {self.racing_waypoint_index}, moving to next waypoint")
+                    else:
+                        print("Reached final waypoint, race completed")
+                
+                control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
+
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
 
 
