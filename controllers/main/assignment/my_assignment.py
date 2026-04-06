@@ -22,25 +22,41 @@ import cv2
 # "q_w": W Quaternion value
 
 # A link to further information on how to access the sensor data on the Crazyflie hardware for the hardware practical can be found here: https://www.bitcraze.io/documentation/repository/crazyflie-firmware/master/api/logs/#stateestimate
-
+INIT = 0
+HOVER = 1
+DETECT = 2
+TRAVEL = 3
+COMPUTE_PATH = 4
+RACE = 5
 
 class MyAssignment:
     def __init__(self):
         # ---- INITIALISE YOUR VARIABLES HERE ----
+        self.state = INIT
+        self.start_x = 0
+        self.start_y = 0
+        self.start_yaw = 0
         pass
 
     def compute_command(self, sensor_data, camera_data, dt):
 
         # NOTE: Displaying the camera image with cv2.imshow() will throw an error because GUI operations should be performed in the main thread.
         # If you want to display the camera image you can call it in main.py.
-
+        
         # Take off example
-        if sensor_data['z_global'] < 0.49:
+        '''if sensor_data['z_global'] < 0.49:
             control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, sensor_data['yaw']]
-            return control_command
+            return control_command'''
 
         # ---- YOUR CODE HERE ----
-        control_command = [sensor_data['x_global'], sensor_data['y_global'], 1.0, sensor_data['yaw']]
+
+        if self.state == INIT:
+            self.start_x = sensor_data['x_global']
+            self.start_y = sensor_data['y_global']
+            self.start_yaw = sensor_data['yaw']
+            self.state = HOVER
+        if self.state == HOVER:
+            control_command = [self.start_x, self.start_y, 1.0, self.start_yaw]
 
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
 

@@ -187,7 +187,7 @@ class CrazyflieInDroneDome(Supervisor):
     # Randomise the positions of the drone, obstacles, goal, take-off pad and landing pad
     def randomise_positions(self):
                                
-        for i in range(self.num_segments):
+        for i in range(self.num_segments): 
 
             # Randomise the angular position of the gate in polar coordinates
             if i == 0:
@@ -723,7 +723,6 @@ if __name__ == '__main__':
 
                         # Read the camera feed
                         camera_data = drone.read_camera()
-                        
                         # Update the sensor data in the thread
                         with sensor_lock:
                             latest_sensor_data = sensor_data
@@ -731,6 +730,8 @@ if __name__ == '__main__':
 
                         # Call the PID controller to get the motor commands
                         motorPower = drone.PID_CF.setpoint_to_pwm(drone.dt_ctrl, current_setpoint, latest_sensor_data)
+                        print('Current setpoint:', current_setpoint)
+                        print('Current sensor data x:', latest_sensor_data['x_global'], 'y:', latest_sensor_data['y_global'], 'z:', latest_sensor_data['z_global'], 'yaw:', latest_sensor_data['yaw'])
                         # motorPower = drone.PID_CF.setpoint_to_pwm(dt_ctrl, current_setpoint, latest_sensor_data)
 
                 if exp_num == 4:
