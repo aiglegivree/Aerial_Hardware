@@ -36,7 +36,8 @@ class MyAssignment:
         self.start_x = 0
         self.start_y = 0
         self.start_yaw = 0
-        pass
+        self.gate_pos = np.zeros((5, 4)) # five gates with x,y,z pos and yaw angle of the center of the gate
+        self.yaw_rate = np.pi/4 # yaw rate in radians per second
 
     def compute_command(self, sensor_data, camera_data, dt):
 
@@ -55,9 +56,28 @@ class MyAssignment:
             self.start_y = sensor_data['y_global']
             self.start_yaw = sensor_data['yaw']
             self.state = HOVER
+
         if self.state == HOVER:
             control_command = [self.start_x, self.start_y, 1.0, self.start_yaw]
+            if abs(sensor_data['z_global'] - 1.0) < 0.05:
+                self.state = DETECT
+        
+        if self.state == DETECT:
+            # Here you would add your object detection code using camera_data
+            # For example, you could use OpenCV to process the camera image and detect the target object
+            # If the object is detected, you would then transition to the TRAVEL state
+            gate_detected = False # This should be set to True if the gate is detected
+            ##detection logic to implement here, which sets gate_detected to True if the gate is detected and also updates self.gate_pos with the position of the detected gate
 
+            if not gate_detected:
+                new_yaw = sensor_data['yaw'] + self.yaw_rate * dt
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], new_yaw]   
+            else:
+                self.state = TRAVEL
+
+        if self.state == TRAVEL:
+            #not yet implemented
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], sensor_data['yaw']] # You can set the control command to the current position and yaw while you are implementing the detection logic
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
 
 
