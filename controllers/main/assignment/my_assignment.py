@@ -33,6 +33,7 @@ TRAVEL_GATE = 6
 COMPUTE_PATH = 7
 RACE = 8
 
+
 MIN_HEIGHT_PIXELS = 20
 
 class MyAssignment:
@@ -230,7 +231,7 @@ class MyAssignment:
             H = (F + G) / 2
             dx = H[0] - sensor_data['x_global']
             dy = H[1] - sensor_data['y_global']
-            gate_yaw = np.arctan2(dy, dx)
+            gate_yaw = np.arctan2(dy, dx) 
             gate_index = self.curr_gate_index
             self.gate_pos[gate_index,:] = [H[0], H[1], H[2], gate_yaw] # Assuming yaw of gate is 0, you can change this if you have a different method to estimate the gate's yaw
             self.curr_gate_index += 1
@@ -300,7 +301,7 @@ class MyAssignment:
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
 
         if self.state == RACE:
-            #PAS ENCORE FAITE
+            #VERSION SUPER BASIQUE QUI FONCTIONNE MAIS QUI N'EST PAS OPTIMISEE DU TOUT, IL FAUT JUSTE SUIVRE LES WAYPOINTS DANS L'ORDRE, IL N'Y A PAS DE CONTROLEUR AVANCE NI DE PREVISION DES PROCHAINES POSITIONS, C'EST JUSTE UN SUIVI DE CHEMIN BASIQUE
             if self.racing_waypoint_index >= len(self.racing_waypoints):
                 control_command = [self.start_x, self.start_y, 1.0, self.start_yaw] # hover at the starting position after finishing
             else:
