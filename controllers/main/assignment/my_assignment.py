@@ -161,45 +161,30 @@ class MyAssignment:
                 print("Reached hover altitude, transitioning to DETECT_1 state")
         
         if self.state == DETECT_1:
-            # If the object is detected, you would then transition to the LATERAL_TRAVEL state
-            #gate_detected = False # This should be set to True if the gate is detected
             gate_valid = False
             gate_in_sight = False
             img_bgr = cv2.cvtColor(camera_data, cv2.COLOR_BGRA2BGR)
             img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-            # Define the lower and upper bounds for the color of the gate in HSV color space
             lower_pink = np.array([140,50,50])
             upper_pink = np.array([160,255,255])
-            # Create a mask using the defined color bounds
             mask = cv2.inRange(img_hsv, lower_pink, upper_pink)
-            # Find contours in the mask
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) 
 
-            
             if len(contours) > 0:
                 tallest_contour = max(contours, key=lambda c: cv2.boundingRect(c)[3])
                 H = mask.shape[0]
                 W = mask.shape[1]
 
                 padding = 10
-
-                #to see if the detected contour touches the edge of the image, 
                 touches_top = np.any(mask[:padding, :] > 0)      
                 touches_bottom = np.any(mask[H-padding:, :] > 0)  
                 touches_left = np.any(mask[:, :padding] > 0)      
                 touches_right = np.any(mask[:, W-padding:] > 0)
-
                 is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
 
                 _,_,_,h = cv2.boundingRect(tallest_contour)
 
-
                 if cv2.contourArea(tallest_contour) > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
-                    
-                    # --- 1. PROJECTION DU RAYON VISUEL (Bypass de la caméra) ---
-                    # Au lieu d'utiliser les pixels, on projette un "laser" à 3.5m devant le drone
-                    # Cela garantit de traverser le bon cadran même si la porte est loin
-                    # --- 1. ESTIMATION DYNAMIQUE DE LA DISTANCE ---
                     focal_length = 161.013922282
                     real_height = 0.4 
                     estimated_distance = (focal_length * real_height) / h
@@ -211,43 +196,36 @@ class MyAssignment:
                     est_gate_x = drone_x + estimated_distance * np.cos(drone_yaw)
                     est_gate_y = drone_y + estimated_distance * np.sin(drone_yaw)
                     
-                    # --- 2. CALCUL DE L'ANGLE ---
                     center_x, center_y = 4.0, 4.0
                     angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
                     angle_deg = np.degrees(angle_rad)
                     
-                    # Angle "Horloge" de la porte détectée
                     clock_angle = (360 - angle_deg + 15) % 360
-                    
-                    # Angle "Idéal" du centre du cadran attendu
                     expected_cadran = self.expected_cadrans[self.curr_gate_index]
                     expected_center_angle = expected_cadran * 30 + 15
                     
-                    # Différence entre ce qu'on voit et ce qu'on attend (gère le passage par 360°)
                     angle_diff = abs(clock_angle - expected_center_angle)
                     angle_diff = min(angle_diff, 360 - angle_diff)
                     
-                    print(f"Angle estimé: {clock_angle:.1f}° | Attendu: {expected_center_angle:.1f}° | Différence: {angle_diff:.1f}°")
-                    
-                    # --- 3. VALIDATION AVEC TOLÉRANCE ---
                     if angle_diff <= 45.0:
-                        
-                        # --- NOUVEAU : Réinitialisation de la recherche de secours ---
+                        # Réinitialisation de la recherche de secours
                         self.yaw_accumulated = 0.0
                         self.is_vertical_search_active = False
+                        
+                        gate_in_sight = True 
+                        
+                        # On sauvegarde la position de la porte et la distance pour le pas de côté
+                        self.look_at_x = est_gate_x
+                        self.look_at_y = est_gate_y
+                        self.current_estimated_dist = estimated_distance
 
-                        # --- AJOUT : 1er passage, on fige la cible de freinage ! ---
-                        if not gate_in_sight: 
+                        # 1er passage, on fige la cible de freinage !
+                        if self.stop_x is None: 
                             self.stop_x = sensor_data['x_global']
                             self.stop_y = sensor_data['y_global']
-                            # On sauvegarde aussi la position de la porte pour la regarder
-                            self.look_at_x = est_gate_x
-                            self.look_at_y = est_gate_y
                             
-                        gate_in_sight = True # C'est la bonne porte !
-                        
                         global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
-                        if global_speed < 0.1: # On attend d'être stable
+                        if global_speed < 0.1: 
                             corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
 
                             quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
@@ -267,43 +245,46 @@ class MyAssignment:
                             self.P = pos_drone + (R_body_to_world @ cam_offset_body)
                             gate_valid = True
                     else:
-                        # Différence trop grande (> 45°), on ignore
                         gate_in_sight = False
 
             if gate_valid:
                 self.state = LATERAL_TRAVEL
-                print("Gate detected, transitioning to LATERAL_TRAVEL state")
-                yaw = sensor_data['yaw']
                 
-                # --- MODIFICATION : Réduction à 0.35m et Rotation orbitale ---
-                lateral_travel = 0.35 
+                # --- LE DÉPLACEMENT LATÉRAL DYNAMIQUE ---
+                # On se décale d'environ 25% de la distance estimée.
+                # Plafonné entre 0.35m (minimum syndical) et 1.0m (maximum pour ne pas taper un mur).
+                lateral_travel = min(1.0, max(0.35, self.current_estimated_dist * 0.25))
+                print(f"Porte détectée à {self.current_estimated_dist:.2f}m. Déplacement latéral de {lateral_travel:.2f}m")
+                
+                yaw = sensor_data['yaw']
                 self.x_target = sensor_data['x_global'] + lateral_travel * np.sin(yaw)
                 self.y_target = sensor_data['y_global'] - lateral_travel * np.cos(yaw)
                 self.z_target = sensor_data['z_global']
                 self.yaw_target = np.arctan2(self.look_at_y - self.y_target, self.look_at_x - self.x_target)
                 
+                # On reset les freins pour la prochaine étape
+                self.stop_x = None 
+                self.stop_y = None
+                
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
+                
             elif gate_in_sight:
-                # --- MODIFICATION : Freinage avec la position figée ---
                 control_command = [self.stop_x, self.stop_y, sensor_data['z_global'], self.yaw_target]
             else:
+                self.stop_x = None
+                self.stop_y = None
+                
                 # --- RECHERCHE VERTICALE DE SECOURS ---
                 self.yaw_target += self.yaw_rate * dt
                 self.yaw_accumulated += self.yaw_rate * dt
                 
-                # Si on a fait un tour complet (360° = 2 * pi)
                 if self.yaw_accumulated >= 2 * np.pi:
                     self.is_vertical_search_active = True
                 
-                # Altitude de base
                 z_cmd = 1.15
-                
                 if self.is_vertical_search_active:
-                    # On vérifie si on a atteint la cible verticale actuelle
                     if abs(sensor_data['z_global'] - self.vertical_search_target) < 0.1:
-                        # Inversion de la cible (ping-pong entre 0.7m et 2.0m)
                         self.vertical_search_target = 0.7 if self.vertical_search_target == 2.0 else 2.0
-                    
                     z_cmd = self.vertical_search_target
                     
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], z_cmd, self.yaw_target]
