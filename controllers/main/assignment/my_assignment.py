@@ -100,7 +100,12 @@ class MyAssignment:
         self.racing_waypoint_index = 0
 
         # Toggle to enable/disable final race plot generation
-        self.show_plot = True
+        self.show_plot = False
+        self.show_terminal_prints = False
+
+    def terminal_print(self, message):
+        if self.show_terminal_prints:
+            print(message)
 
     def get_corner_positions_2d_sorted(self, contour):
         #to get the four corners postions in 3D space
@@ -151,14 +156,14 @@ class MyAssignment:
             self.start_y = sensor_data['y_global']
             self.start_yaw = sensor_data['yaw']
             self.state = HOVER
-            print("Initialized, transitioning to HOVER state")
+            self.terminal_print("Initialized, transitioning to HOVER state")
 
         if self.state == HOVER:
             control_command = [self.start_x, self.start_y, 1.15, self.start_yaw]
             if abs(sensor_data['z_global'] - 1.15) < 0.05:
                 self.state = DETECT_1
                 self.yaw_target = sensor_data['yaw']
-                print("Reached hover altitude, transitioning to DETECT_1 state")
+                self.terminal_print("Reached hover altitude, transitioning to DETECT_1 state")
         
         if self.state == DETECT_1:
             gate_valid = False
@@ -254,7 +259,7 @@ class MyAssignment:
                 # On se décale d'environ 25% de la distance estimée.
                 # Plafonné entre 0.35m (minimum syndical) et 1.0m (maximum pour ne pas taper un mur).
                 lateral_travel = min(1.0, max(0.35, self.current_estimated_dist * 0.25))
-                print(f"Porte détectée à {self.current_estimated_dist:.2f}m. Déplacement latéral de {lateral_travel:.2f}m")
+                self.terminal_print(f"Porte détectée à {self.current_estimated_dist:.2f}m. Déplacement latéral de {lateral_travel:.2f}m")
                 
                 yaw = sensor_data['yaw']
                 self.x_target = sensor_data['x_global'] + lateral_travel * np.sin(yaw)
@@ -293,7 +298,7 @@ class MyAssignment:
             if np.linalg.norm(np.array([sensor_data['x_global'] - self.x_target, sensor_data['y_global'] - self.y_target, sensor_data['z_global'] - self.z_target])) < 0.05:
                 self.state = DETECT_2
                 self.yaw_target = sensor_data['yaw']
-                print("Reached lateral travel position, transitioning to DETECT_2 state")
+                self.terminal_print("Reached lateral travel position, transitioning to DETECT_2 state")
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
 
         if self.state == DETECT_2:
@@ -351,7 +356,7 @@ class MyAssignment:
                     angle_diff = abs(clock_angle - expected_center_angle)
                     angle_diff = min(angle_diff, 360 - angle_diff)
                     
-                    print(f"[DETECT_2] Angle: {clock_angle:.1f}° | Attendu: {expected_center_angle:.1f}° | Différence: {angle_diff:.1f}°")
+                    self.terminal_print(f"[DETECT_2] Angle: {clock_angle:.1f}° | Attendu: {expected_center_angle:.1f}° | Différence: {angle_diff:.1f}°")
                     
                     # --- 3. VALIDATION AVEC TOLÉRANCE ---
                     # --- 3. VALIDATION AVEC TOLÉRANCE ---
@@ -390,7 +395,7 @@ class MyAssignment:
             # --- TRANSITIONS D'ÉTAT ---
             if gate_valid:
                 self.state = COMPUTE_GATE_POS
-                print("Gate 2 detected and validated, transitioning to COMPUTE_GATE_POS")
+                self.terminal_print("Gate 2 detected and validated, transitioning to COMPUTE_GATE_POS")
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
             elif gate_in_sight:
                 # --- MODIFICATION : Freinage avec la position figée ---
@@ -465,7 +470,7 @@ class MyAssignment:
             
             self.spline_t = 0.0
             self.state = TRAVEL_GATE
-            print(f"Spline d'approche (avec Z-Clamp) calculée ! Début du vol...")
+            self.terminal_print(f"Spline d'approche (avec Z-Clamp) calculée ! Début du vol...")
 
         
         if self.state == TRAVEL_GATE:
@@ -509,7 +514,7 @@ class MyAssignment:
                 ]))
                 
                 if dist_to_exit < 0.2:
-                    print(f"Porte franchie ! Distance: {dist_to_exit:.2f}m")
+                    self.terminal_print(f"Porte franchie ! Distance: {dist_to_exit:.2f}m")
                     
                     self.stop_x = sensor_data['x_global']
                     self.stop_y = sensor_data['y_global']
@@ -524,8 +529,8 @@ class MyAssignment:
         
         if self.state == COMPUTE_PATH:
             if self.curr_gate_index < 5:
-                print("CRITICAL ERROR: Not all gate have been detected")
-            print("--- Vérification et Tri des portes ---")
+                self.terminal_print("CRITICAL ERROR: Not all gate have been detected")
+            self.terminal_print("--- Vérification et Tri des portes ---")
             
             # 1. On utilise le centre connu du circuit
             cx, cy = 4.0, 4.0
@@ -542,7 +547,7 @@ class MyAssignment:
             self.gate_pos = self.gate_pos[sorted_indices]
             self.gate_corner = self.gate_corner[sorted_indices]
             
-            print(f"Ordre des portes corrigé : {sorted_indices}")
+            self.terminal_print(f"Ordre des portes corrigé : {sorted_indices}")
             # ----------------------------------------------
                 
             nbr_of_lap = 2
@@ -627,13 +632,13 @@ class MyAssignment:
                 else:
                     plot_path = os.path.join(os.path.dirname(__file__), "race_gates_plot.png")
                     fig.savefig(plot_path, dpi=150)
-                    print(f"Plot saved to {plot_path} (GUI disabled in planner thread)")
+                    self.terminal_print(f"Plot saved to {plot_path} (GUI disabled in planner thread)")
                 if is_main_thread:
                     plt.close(fig)
             else:
-                print("Plotting disabled (show_plot=False)")
+                self.terminal_print("Plotting disabled (show_plot=False)")
             self.state = RACE
-            print("Computed racing path, transitioning to RACE state")
+            self.terminal_print("Computed racing path, transitioning to RACE state")
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
 
         if self.state == RACE:
@@ -656,9 +661,9 @@ class MyAssignment:
                 if distance < 0.4:
                     self.racing_waypoint_index += 1
                     if self.racing_waypoint_index < len(self.racing_waypoints):
-                        print(f"Reached waypoint {self.racing_waypoint_index}, moving to next waypoint")
+                        self.terminal_print(f"Reached waypoint {self.racing_waypoint_index}, moving to next waypoint")
                     else:
-                        print("Reached final waypoint, race completed")
+                        self.terminal_print("Reached final waypoint, race completed")
                         
 
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
