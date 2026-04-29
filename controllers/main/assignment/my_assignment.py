@@ -1,6 +1,8 @@
 import numpy as np
 import time
 import cv2
+import os
+import threading
 from scipy.spatial.transform import Rotation as R
 
 # The available ground truth state measurements can be accessed by calling sensor_data[item]. All values of "item" are provided as defined in main.py within the function read_sensors.
@@ -46,24 +48,66 @@ class MyAssignment:
         self.gate_pos = np.zeros((5, 4)) # x, y, z, yaw for each gate (5)
         self.gate_corner = np.zeros((5, 4, 3)) # Assuming 4 corners for each gate, you can change this if your gate has a different number of corners
         self.yaw_rate = np.pi/4 # yaw rate in radians per second
+        self.req_frames = 5
+        self.frames_detected = 0
 
         self.P = None
         self.r = None
+        self.r_corners = np.zeros((4, 3))
         self.Q = None
         self.s = None
+        self.s_corners = np.zeros((4, 3))
 
         self.is_approching_gate = True
         self.approach_distance = 0.3 # distance from which the drone should start approaching the gate, you can adjust this based on your needs
 
+        self.current_gate_corners_3d = None
+        
         self.x_target = None
         self.y_target = None
         self.z_target = None
         self.yaw_target = None
 
         self.curr_gate_index = 0
+        self.expected_cadrans = [4, 2, 0, 10, 8]
 
         self.racing_waypoints = []
         self.racing_waypoint_index = 0
+
+        # Toggle to enable/disable final race plot generation
+        self.show_plot = False
+
+    def get_corner_positions_2d_sorted(self, contour):
+        #to get the four corners postions in 3D space
+
+        perimeter = cv2.arcLength(contour, True)
+        epsilon = 0.03 * perimeter 
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+
+        corners_2d = None
+
+        if len(approx) == 4:
+            corners_2d = approx.reshape(4, 2)
+        else:
+            # PLAN B : Si le contour est bruité ou un peu arrondi, 
+            # on l'enferme dans le plus petit rectangle orienté possible
+            rect = cv2.minAreaRect(contour)
+            box = cv2.boxPoints(rect)
+            corners_2d = np.int32(box)
+
+        #top-bottom sorting
+        sorted_indices = np.argsort(corners_2d[:, 1])
+        top_corners = corners_2d[sorted_indices[:2]]    # Les 2 points les plus hauts
+        bottom_corners = corners_2d[sorted_indices[2:]]
+
+        #left-right sorting
+        top_left, top_right = top_corners[np.argsort(top_corners[:, 0])]
+        bottom_left, bottom_right = bottom_corners[np.argsort(bottom_corners[:, 0])]
+
+        corners_2d_sorted = np.array([top_left, top_right, bottom_right, bottom_left])
+
+        return corners_2d_sorted
+
 
     def compute_command(self, sensor_data, camera_data, dt):
 
@@ -93,7 +137,9 @@ class MyAssignment:
         
         if self.state == DETECT_1:
             # If the object is detected, you would then transition to the LATERAL_TRAVEL state
-            gate_detected = False # This should be set to True if the gate is detected
+            #gate_detected = False # This should be set to True if the gate is detected
+            gate_valid = False
+            gate_in_sight = False
             img_bgr = cv2.cvtColor(camera_data, cv2.COLOR_BGRA2BGR)
             img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             # Define the lower and upper bounds for the color of the gate in HSV color space
@@ -106,11 +152,11 @@ class MyAssignment:
 
             
             if len(contours) > 0:
-                largest_contour = max(contours, key=cv2.contourArea)
+                tallest_contour = max(contours, key=lambda c: cv2.boundingRect(c)[3])
                 H = mask.shape[0]
                 W = mask.shape[1]
 
-                padding = 40
+                padding = 10
 
                 #to see if the detected contour touches the edge of the image, 
                 touches_top = np.any(mask[:padding, :] > 0)      
@@ -120,41 +166,89 @@ class MyAssignment:
 
                 is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
 
-                x,y,w,h = cv2.boundingRect(largest_contour)
+                _,_,_,h = cv2.boundingRect(tallest_contour)
 
-                if cv2.contourArea(largest_contour) > 100 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
-                    u_pixel = x + w/2
-                    v_pixel = y + h/2
 
-                    vect_x = u_pixel - camera_data.shape[1]/2
-                    vect_y = v_pixel - camera_data.shape[0]/2
-                    vect_z = 161.013922282 #this is the focal length of the camera in pixels from the PDF
-                    v_camera = np.array([vect_x, vect_y, vect_z])
-                    R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]]) # Rotation matrix from camera frame to body frame
-                    v_body = R_cam_to_body @ v_camera
+                if cv2.contourArea(tallest_contour) > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
+                    
+                    # --- 1. PROJECTION DU RAYON VISUEL (Bypass de la caméra) ---
+                    # Au lieu d'utiliser les pixels, on projette un "laser" à 3.5m devant le drone
+                    # Cela garantit de traverser le bon cadran même si la porte est loin
+                    # --- 1. ESTIMATION DYNAMIQUE DE LA DISTANCE ---
+                    focal_length = 161.013922282
+                    real_height = 0.4 
+                    estimated_distance = (focal_length * real_height) / h
+                    
+                    drone_x = sensor_data['x_global']
+                    drone_y = sensor_data['y_global']
+                    drone_yaw = sensor_data['yaw']
+                    
+                    est_gate_x = drone_x + estimated_distance * np.cos(drone_yaw)
+                    est_gate_y = drone_y + estimated_distance * np.sin(drone_yaw)
+                    
+                    # --- 2. CALCUL DE L'ANGLE ---
+                    center_x, center_y = 4.0, 4.0
+                    angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
+                    angle_deg = np.degrees(angle_rad)
+                    
+                    # Angle "Horloge" de la porte détectée
+                    clock_angle = (360 - angle_deg + 15) % 360
+                    
+                    # Angle "Idéal" du centre du cadran attendu
+                    expected_cadran = self.expected_cadrans[self.curr_gate_index]
+                    expected_center_angle = expected_cadran * 30 + 15
+                    
+                    # Différence entre ce qu'on voit et ce qu'on attend (gère le passage par 360°)
+                    angle_diff = abs(clock_angle - expected_center_angle)
+                    angle_diff = min(angle_diff, 360 - angle_diff)
+                    
+                    print(f"Angle estimé: {clock_angle:.1f}° | Attendu: {expected_center_angle:.1f}° | Différence: {angle_diff:.1f}°")
+                    
+                    # --- 3. VALIDATION AVEC TOLÉRANCE ---
+                    # Le cadran fait 30° (±15° depuis son centre). En acceptant ±25°, 
+                    # on déborde sur les cadrans vides voisins, effaçant le bug des frontières !
+                    if angle_diff <= 45.0:
+                        gate_in_sight = True # C'est la bonne porte !
+                        
+                        global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
+                        if global_speed < 0.1: # On attend d'être stable
+                            corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
 
-                    quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
-                    R_body_to_world = R.from_quat(quaternion).as_matrix()
-                    self.r = R_body_to_world @ v_body
+                            quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
+                            R_body_to_world = R.from_quat(quaternion).as_matrix()
+                            R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]])
 
-                    cam_offset_body = np.array([0.03, 0, 0.01])
-                    pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
-                    self.P = pos_drone + (R_body_to_world @ cam_offset_body)
-                    gate_detected = True
+                            for i, corner in enumerate(corners_2d_sorted):
+                                vect_x = corner[0] - camera_data.shape[1]/2
+                                vect_y = corner[1] - camera_data.shape[0]/2
+                                vect_z = focal_length
+                                v_camera = np.array([vect_x, vect_y, vect_z])
+                                v_body = R_cam_to_body @ v_camera
+                                self.r_corners[i] = R_body_to_world @ v_body
 
-            if not gate_detected:
-                self.yaw_target += self.yaw_rate * dt
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]   
-            else:
+                            cam_offset_body = np.array([0.03, 0, 0.01])
+                            pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
+                            self.P = pos_drone + (R_body_to_world @ cam_offset_body)
+                            gate_valid = True
+                    else:
+                        # Différence trop grande (> 25°), on ignore
+                        gate_in_sight = False
+
+            if gate_valid:
                 self.state = LATERAL_TRAVEL
                 print("Gate detected, transitioning to LATERAL_TRAVEL state")
                 yaw = sensor_data['yaw']
-                lateral_travel = 0.6
+                lateral_travel = 0.5
                 self.x_target = sensor_data['x_global'] + lateral_travel * np.sin(yaw)
                 self.y_target = sensor_data['y_global'] - lateral_travel * np.cos(yaw)
                 self.z_target = sensor_data['z_global']
                 self.yaw_target = yaw
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
+            elif gate_in_sight:
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
+            else:
+                self.yaw_target += self.yaw_rate * dt
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
 
         if self.state == LATERAL_TRAVEL:
             if np.linalg.norm(np.array([sensor_data['x_global'] - self.x_target, sensor_data['y_global'] - self.y_target, sensor_data['z_global'] - self.z_target])) < 0.05:
@@ -164,7 +258,8 @@ class MyAssignment:
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
 
         if self.state == DETECT_2:
-            gate_detected = False # This should be set to True if the gate is detected
+            gate_valid = False
+            gate_in_sight = False
             img_bgr = cv2.cvtColor(camera_data, cv2.COLOR_BGRA2BGR)
             img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             # Define the lower and upper bounds for the color of the gate in HSV color space
@@ -176,65 +271,114 @@ class MyAssignment:
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) 
 
             if len(contours) > 0:
-                largest_contour = max(contours, key=cv2.contourArea)
+                tallest_contour = max(contours, key=lambda c: cv2.boundingRect(c)[3])
                 H = mask.shape[0]
                 W = mask.shape[1]
 
-                #to see if the detected contour touches the edge of the image, 
-                touches_top = np.any(mask[0, :] > 0)
-                touches_bottom = np.any(mask[H-1, :] > 0)
-                touches_left = np.any(mask[:, 0] > 0)
-                touches_right = np.any(mask[:, W-1] > 0)
+                # --- OCCLUSION LOCALE SUR LA PORTE CIBLE ---
+                x, y, w, h = cv2.boundingRect(tallest_contour)
+                padding = 5
+                
+                touches_top = (y < padding)
+                touches_bottom = (y + h > H - padding)
+                touches_left = (x < padding)
+                touches_right = (x + w > W - padding)
 
                 is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
 
-                x,y,w,h = cv2.boundingRect(largest_contour)
+                if cv2.contourArea(tallest_contour) > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
+                    
+                    # --- 1. ESTIMATION DYNAMIQUE DE LA DISTANCE ---
+                    focal_length = 161.013922282
+                    real_height = 0.4 
+                    estimated_distance = (focal_length * real_height) / h
+                    
+                    drone_x = sensor_data['x_global']
+                    drone_y = sensor_data['y_global']
+                    drone_yaw = sensor_data['yaw']
+                    
+                    est_gate_x = drone_x + estimated_distance * np.cos(drone_yaw)
+                    est_gate_y = drone_y + estimated_distance * np.sin(drone_yaw)
+                    
+                    # --- 2. CALCUL DE L'ANGLE ---
+                    center_x, center_y = 4.0, 4.0
+                    angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
+                    angle_deg = np.degrees(angle_rad)
+                    
+                    clock_angle = (360 - angle_deg + 15) % 360
+                    expected_cadran = self.expected_cadrans[self.curr_gate_index]
+                    expected_center_angle = expected_cadran * 30 + 15
+                    
+                    angle_diff = abs(clock_angle - expected_center_angle)
+                    angle_diff = min(angle_diff, 360 - angle_diff)
+                    
+                    print(f"[DETECT_2] Angle: {clock_angle:.1f}° | Attendu: {expected_center_angle:.1f}° | Différence: {angle_diff:.1f}°")
+                    
+                    # --- 3. VALIDATION AVEC TOLÉRANCE ---
+                    if angle_diff <= 45.0:
+                        gate_in_sight = True 
+                        
+                        global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
+                        if global_speed < 0.1: 
+                            corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
 
-                if cv2.contourArea(largest_contour) > 100 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
-                    u_pixel = x + w/2
-                    v_pixel = y + h/2
+                            quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
+                            R_body_to_world = R.from_quat(quaternion).as_matrix()
+                            R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]]) 
 
-                    vect_x = u_pixel - camera_data.shape[1]/2
-                    vect_y = v_pixel - camera_data.shape[0]/2
-                    vect_z = 161.013922282 #this is the focal length of the camera in pixels from the PDF
-                    v_camera_2 = np.array([vect_x, vect_y, vect_z])
-                    R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]]) # Rotation matrix from camera frame to body frame
-                    v_body_2 = R_cam_to_body @ v_camera_2
+                            for i, corner in enumerate(corners_2d_sorted):
+                                vect_x = corner[0] - camera_data.shape[1]/2
+                                vect_y = corner[1] - camera_data.shape[0]/2
+                                vect_z = focal_length 
+                                v_camera_2 = np.array([vect_x, vect_y, vect_z])
+                                v_body_2 = R_cam_to_body @ v_camera_2
+                                self.s_corners[i] = R_body_to_world @ v_body_2
 
-                    quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
-                    R_body_to_world = R.from_quat(quaternion).as_matrix()
-                    self.s = R_body_to_world @ v_body_2
-
-                    cam_offset_body = np.array([0.03, 0, 0.01])
-                    pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
-                    self.Q = pos_drone + (R_body_to_world @ cam_offset_body)
-                    gate_detected = True
-
-            if not gate_detected:
-                self.yaw_target += 0.5*self.yaw_rate * dt
+                            cam_offset_body = np.array([0.03, 0, 0.01])
+                            pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
+                            self.Q = pos_drone + (R_body_to_world @ cam_offset_body)
+                            gate_valid = True
+                    else:
+                        gate_in_sight = False
+            # --- TRANSITIONS D'ÉTAT ---
+            if gate_valid:
+                self.state = COMPUTE_GATE_POS
+                print("Gate 2 detected and validated, transitioning to COMPUTE_GATE_POS")
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
+            elif gate_in_sight:
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
             else:
-                self.state = COMPUTE_GATE_POS
-                print("Gate detected, transitioning to COMPUTE_GATE_POS state")
+                self.yaw_target += 0.5 * self.yaw_rate * dt
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
 
         if self.state == COMPUTE_GATE_POS:
             A = np.zeros((3,2))
             b = np.zeros((3,1))
-            A[:,0] = self.r
-            A[:,1] = -self.s
-            b = self.Q - self.P
-            sol = np.linalg.pinv(A) @ b
-            lmbda, mu = sol[0], sol[1]
-            F = self.P + lmbda * self.r
-            G = self.Q + mu * self.s
-            H = (F + G) / 2
-            dx = H[0] - sensor_data['x_global']
-            dy = H[1] - sensor_data['y_global']
-            gate_yaw = np.arctan2(dy, dx) 
+            corners_3d = np.zeros((4, 3))
+            for i in range(len(self.r_corners)):
+                A[:,0] = self.r_corners[i]
+                A[:,1] = -self.s_corners[i]
+                b = self.Q - self.P
+                sol = np.linalg.pinv(A) @ b
+                lmbda, mu = sol[0], sol[1]
+                F = self.P + lmbda * self.r_corners[i]
+                G = self.Q + mu * self.s_corners[i]
+                corners_3d[i] = (F + G) / 2
+            H = np.mean(corners_3d, axis=0)
+
+            v_width = corners_3d[1] - corners_3d[0]
+
+            dx_normal = -v_width[1]
+            dy_normal = v_width[0]
+            gate_yaw = np.arctan2(dy_normal, dx_normal)
+            
             gate_index = self.curr_gate_index
             self.gate_pos[gate_index,:] = [H[0], H[1], H[2], gate_yaw] # Assuming yaw of gate is 0, you can change this if you have a different method to estimate the gate's yaw
+
+            self.gate_corner[gate_index, :] = corners_3d
+
             self.curr_gate_index += 1
+
             self.x_target = H[0]
             self.y_target = H[1]
             self.z_target = H[2]
@@ -270,7 +414,28 @@ class MyAssignment:
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
         
         if self.state == COMPUTE_PATH:
-            #PAS ECNORE FAITE
+            if self.curr_gate_index < 5:
+                print("CRITICAL ERROR: Not all gate have been detected")
+            print("--- Vérification et Tri des portes ---")
+            
+            # 1. On utilise le centre connu du circuit
+            cx, cy = 4.0, 4.0
+            
+            # 2. Calcul de l'angle géométrique (atan2) de chaque porte
+            angles = np.arctan2(self.gate_pos[:, 1] - cy, self.gate_pos[:, 0] - cx)
+            
+            # 3. Le tri magique : argsort classe du plus petit au plus grand angle.
+            # Grâce à l'axe de Webots, cela correspond EXACTEMENT à l'ordre anti-horaire 
+            # en partant de la zone de Take-Off !
+            sorted_indices = np.argsort(angles)
+            
+            # 4. On réécrit nos mémoires dans le bon ordre
+            self.gate_pos = self.gate_pos[sorted_indices]
+            self.gate_corner = self.gate_corner[sorted_indices]
+            
+            print(f"Ordre des portes corrigé : {sorted_indices}")
+            # ----------------------------------------------
+                
             nbr_of_lap = 2
             for lap in range(nbr_of_lap):
                 for gate_index in range(5):
@@ -323,7 +488,65 @@ class MyAssignment:
                         print(f"Reached waypoint {self.racing_waypoint_index}, moving to next waypoint")
                     else:
                         print("Reached final waypoint, race completed")
-                
+                        if self.show_plot:
+                            # Plot detected gates (position + orientation) and start point
+                            is_main_thread = threading.current_thread() is threading.main_thread()
+                            if is_main_thread:
+                                import matplotlib.pyplot as plt
+                                fig, ax = plt.subplots(figsize=(7, 7))
+                            else:
+                                from matplotlib.figure import Figure
+                                from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+                                fig = Figure(figsize=(7, 7))
+                                FigureCanvas(fig)
+                                ax = fig.add_subplot(111)
+
+                            # Use only initialized gates if needed
+                            gate_indices = [i for i in range(5) if np.linalg.norm(self.gate_pos[i, :3]) > 1e-9]
+                            if len(gate_indices) == 0:
+                                gate_indices = list(range(5))
+
+                            gx = self.gate_pos[gate_indices, 0]
+                            gy = self.gate_pos[gate_indices, 1]
+                            gyaw = self.gate_pos[gate_indices, 3]
+
+                            # Gate centers
+                            ax.scatter(gx, gy, c="magenta", s=70, label="Gates")
+
+                            # Orientation arrows
+                            u = np.cos(gyaw)
+                            v = np.sin(gyaw)
+                            ax.quiver(gx, gy, u, v, angles="xy", scale_units="xy", scale=4, color="purple", width=0.004)
+
+                            # Gate labels
+                            for k, i in enumerate(gate_indices):
+                                ax.text(gx[k] + 0.05, gy[k] + 0.05, f"G{i+1}", color="black", fontsize=9)
+
+                            # Start point
+                            ax.scatter(self.start_x, self.start_y, c="green", marker="*", s=160, label="Start")
+                            ax.text(self.start_x + 0.05, self.start_y + 0.05, "Start", color="green", fontsize=9)
+
+                            ax.set_title("Gate positions and orientations")
+                            ax.set_xlabel("X [m]")
+                            ax.set_ylabel("Y [m]")
+                            ax.set_xlim(0, 8)
+                            ax.set_ylim(0, 8)
+                            ax.axis("equal")
+                            ax.grid(True)
+                            ax.legend()
+                            fig.tight_layout()
+                            if is_main_thread:
+                                plt.show(block=False)
+                                # plt.pause(0.001)
+                            else:
+                                plot_path = os.path.join(os.path.dirname(__file__), "race_gates_plot.png")
+                                fig.savefig(plot_path, dpi=150)
+                                print(f"Plot saved to {plot_path} (GUI disabled in planner thread)")
+                            if is_main_thread:
+                                plt.close(fig)
+                        else:
+                            print("Plotting disabled (show_plot=False)")
+
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
 
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
