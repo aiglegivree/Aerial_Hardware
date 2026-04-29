@@ -75,7 +75,7 @@ class MyAssignment:
         self.racing_waypoint_index = 0
 
         # Toggle to enable/disable final race plot generation
-        self.show_plot = True
+        self.show_plot = False
 
     def get_corner_positions_2d_sorted(self, contour):
         #to get the four corners postions in 3D space
@@ -152,11 +152,11 @@ class MyAssignment:
 
             
             if len(contours) > 0:
-                largest_contour = max(contours, key=cv2.contourArea)
+                tallest_contour = max(contours, key=lambda c: cv2.boundingRect(c)[3])
                 H = mask.shape[0]
                 W = mask.shape[1]
 
-                padding = 40
+                padding = 10
 
                 #to see if the detected contour touches the edge of the image, 
                 touches_top = np.any(mask[:padding, :] > 0)      
@@ -166,10 +166,10 @@ class MyAssignment:
 
                 is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
 
-                _,_,_,h = cv2.boundingRect(largest_contour)
+                _,_,_,h = cv2.boundingRect(tallest_contour)
 
 
-                if cv2.contourArea(largest_contour) > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
+                if cv2.contourArea(tallest_contour) > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
                     
                     # --- 1. PROJECTION DU RAYON VISUEL (Bypass de la caméra) ---
                     # Au lieu d'utiliser les pixels, on projette un "laser" à 3.5m devant le drone
@@ -212,7 +212,7 @@ class MyAssignment:
                         
                         global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
                         if global_speed < 0.1: # On attend d'être stable
-                            corners_2d_sorted = self.get_corner_positions_2d_sorted(largest_contour)
+                            corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
 
                             quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
                             R_body_to_world = R.from_quat(quaternion).as_matrix()
@@ -271,13 +271,13 @@ class MyAssignment:
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) 
 
             if len(contours) > 0:
-                largest_contour = max(contours, key=cv2.contourArea)
+                tallest_contour = max(contours, key=lambda c: cv2.boundingRect(c)[3])
                 H = mask.shape[0]
                 W = mask.shape[1]
 
                 # --- OCCLUSION LOCALE SUR LA PORTE CIBLE ---
-                x, y, w, h = cv2.boundingRect(largest_contour)
-                padding = 15
+                x, y, w, h = cv2.boundingRect(tallest_contour)
+                padding = 5
                 
                 touches_top = (y < padding)
                 touches_bottom = (y + h > H - padding)
@@ -286,7 +286,7 @@ class MyAssignment:
 
                 is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
 
-                if cv2.contourArea(largest_contour) > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
+                if cv2.contourArea(tallest_contour) > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
                     
                     # --- 1. ESTIMATION DYNAMIQUE DE LA DISTANCE ---
                     focal_length = 161.013922282
@@ -320,7 +320,7 @@ class MyAssignment:
                         
                         global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
                         if global_speed < 0.1: 
-                            corners_2d_sorted = self.get_corner_positions_2d_sorted(largest_contour)
+                            corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
 
                             quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
                             R_body_to_world = R.from_quat(quaternion).as_matrix()
@@ -416,6 +416,25 @@ class MyAssignment:
         if self.state == COMPUTE_PATH:
             if self.curr_gate_index < 5:
                 print("CRITICAL ERROR: Not all gate have been detected")
+            print("--- Vérification et Tri des portes ---")
+            
+            # 1. On utilise le centre connu du circuit
+            cx, cy = 4.0, 4.0
+            
+            # 2. Calcul de l'angle géométrique (atan2) de chaque porte
+            angles = np.arctan2(self.gate_pos[:, 1] - cy, self.gate_pos[:, 0] - cx)
+            
+            # 3. Le tri magique : argsort classe du plus petit au plus grand angle.
+            # Grâce à l'axe de Webots, cela correspond EXACTEMENT à l'ordre anti-horaire 
+            # en partant de la zone de Take-Off !
+            sorted_indices = np.argsort(angles)
+            
+            # 4. On réécrit nos mémoires dans le bon ordre
+            self.gate_pos = self.gate_pos[sorted_indices]
+            self.gate_corner = self.gate_corner[sorted_indices]
+            
+            print(f"Ordre des portes corrigé : {sorted_indices}")
+            # ----------------------------------------------
                 
             nbr_of_lap = 2
             for lap in range(nbr_of_lap):
