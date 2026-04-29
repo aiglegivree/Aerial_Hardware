@@ -3,7 +3,12 @@ import time
 import cv2
 import os
 import threading
+import matplotlib.pyplot as plt
+
 from scipy.spatial.transform import Rotation as R
+from scipy.interpolate import CubicSpline
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 
 # The available ground truth state measurements can be accessed by calling sensor_data[item]. All values of "item" are provided as defined in main.py within the function read_sensors.
 # The "item" values that you may later retrieve for the hardware project are:
@@ -51,6 +56,10 @@ class MyAssignment:
         self.req_frames = 5
         self.frames_detected = 0
 
+        self.yaw_accumulated = 0.0          # Somme des angles tournés
+        self.is_vertical_search_active = False
+        self.vertical_search_target = 2.0
+
         self.P = None
         self.r = None
         self.r_corners = np.zeros((4, 3))
@@ -61,12 +70,28 @@ class MyAssignment:
         self.is_approching_gate = True
         self.approach_distance = 0.3 # distance from which the drone should start approaching the gate, you can adjust this based on your needs
 
+        self.stop_x = None
+        self.stop_y = None
+
         self.current_gate_corners_3d = None
         
         self.x_target = None
         self.y_target = None
         self.z_target = None
         self.yaw_target = None
+
+        #for travel splines
+        self.cs_x = None
+        self.cs_y = None
+        self.cs_z = None
+        self.spline_t = 0.0
+
+        self.app_x = 0.0
+        self.app_y = 0.0
+        self.exit_x = 0.0
+        self.exit_y = 0.0
+        self.gate_yaw_target = 0.0
+        self.gate_z_target = 0.0
 
         self.curr_gate_index = 0
         self.expected_cadrans = [4, 2, 0, 10, 8]
@@ -75,7 +100,7 @@ class MyAssignment:
         self.racing_waypoint_index = 0
 
         # Toggle to enable/disable final race plot generation
-        self.show_plot = False
+        self.show_plot = True
 
     def get_corner_positions_2d_sorted(self, contour):
         #to get the four corners postions in 3D space
@@ -205,9 +230,20 @@ class MyAssignment:
                     print(f"Angle estimé: {clock_angle:.1f}° | Attendu: {expected_center_angle:.1f}° | Différence: {angle_diff:.1f}°")
                     
                     # --- 3. VALIDATION AVEC TOLÉRANCE ---
-                    # Le cadran fait 30° (±15° depuis son centre). En acceptant ±25°, 
-                    # on déborde sur les cadrans vides voisins, effaçant le bug des frontières !
                     if angle_diff <= 45.0:
+                        
+                        # --- NOUVEAU : Réinitialisation de la recherche de secours ---
+                        self.yaw_accumulated = 0.0
+                        self.is_vertical_search_active = False
+
+                        # --- AJOUT : 1er passage, on fige la cible de freinage ! ---
+                        if not gate_in_sight: 
+                            self.stop_x = sensor_data['x_global']
+                            self.stop_y = sensor_data['y_global']
+                            # On sauvegarde aussi la position de la porte pour la regarder
+                            self.look_at_x = est_gate_x
+                            self.look_at_y = est_gate_y
+                            
                         gate_in_sight = True # C'est la bonne porte !
                         
                         global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
@@ -231,24 +267,46 @@ class MyAssignment:
                             self.P = pos_drone + (R_body_to_world @ cam_offset_body)
                             gate_valid = True
                     else:
-                        # Différence trop grande (> 25°), on ignore
+                        # Différence trop grande (> 45°), on ignore
                         gate_in_sight = False
 
             if gate_valid:
                 self.state = LATERAL_TRAVEL
                 print("Gate detected, transitioning to LATERAL_TRAVEL state")
                 yaw = sensor_data['yaw']
-                lateral_travel = 0.5
+                
+                # --- MODIFICATION : Réduction à 0.35m et Rotation orbitale ---
+                lateral_travel = 0.35 
                 self.x_target = sensor_data['x_global'] + lateral_travel * np.sin(yaw)
                 self.y_target = sensor_data['y_global'] - lateral_travel * np.cos(yaw)
                 self.z_target = sensor_data['z_global']
-                self.yaw_target = yaw
+                self.yaw_target = np.arctan2(self.look_at_y - self.y_target, self.look_at_x - self.x_target)
+                
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
             elif gate_in_sight:
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
+                # --- MODIFICATION : Freinage avec la position figée ---
+                control_command = [self.stop_x, self.stop_y, sensor_data['z_global'], self.yaw_target]
             else:
+                # --- RECHERCHE VERTICALE DE SECOURS ---
                 self.yaw_target += self.yaw_rate * dt
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
+                self.yaw_accumulated += self.yaw_rate * dt
+                
+                # Si on a fait un tour complet (360° = 2 * pi)
+                if self.yaw_accumulated >= 2 * np.pi:
+                    self.is_vertical_search_active = True
+                
+                # Altitude de base
+                z_cmd = 1.15
+                
+                if self.is_vertical_search_active:
+                    # On vérifie si on a atteint la cible verticale actuelle
+                    if abs(sensor_data['z_global'] - self.vertical_search_target) < 0.1:
+                        # Inversion de la cible (ping-pong entre 0.7m et 2.0m)
+                        self.vertical_search_target = 0.7 if self.vertical_search_target == 2.0 else 2.0
+                    
+                    z_cmd = self.vertical_search_target
+                    
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], z_cmd, self.yaw_target]
 
         if self.state == LATERAL_TRAVEL:
             if np.linalg.norm(np.array([sensor_data['x_global'] - self.x_target, sensor_data['y_global'] - self.y_target, sensor_data['z_global'] - self.z_target])) < 0.05:
@@ -315,7 +373,14 @@ class MyAssignment:
                     print(f"[DETECT_2] Angle: {clock_angle:.1f}° | Attendu: {expected_center_angle:.1f}° | Différence: {angle_diff:.1f}°")
                     
                     # --- 3. VALIDATION AVEC TOLÉRANCE ---
+                    # --- 3. VALIDATION AVEC TOLÉRANCE ---
                     if angle_diff <= 45.0:
+                        
+                        # --- AJOUT : 1er passage, on fige la cible de freinage ! ---
+                        if not gate_in_sight: 
+                            self.stop_x = sensor_data['x_global']
+                            self.stop_y = sensor_data['y_global']
+                            
                         gate_in_sight = True 
                         
                         global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
@@ -340,13 +405,15 @@ class MyAssignment:
                             gate_valid = True
                     else:
                         gate_in_sight = False
+                        
             # --- TRANSITIONS D'ÉTAT ---
             if gate_valid:
                 self.state = COMPUTE_GATE_POS
                 print("Gate 2 detected and validated, transitioning to COMPUTE_GATE_POS")
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
             elif gate_in_sight:
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
+                # --- MODIFICATION : Freinage avec la position figée ---
+                control_command = [self.stop_x, self.stop_y, sensor_data['z_global'], self.yaw_target]
             else:
                 self.yaw_target += 0.5 * self.yaw_rate * dt
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
@@ -364,53 +431,114 @@ class MyAssignment:
                 F = self.P + lmbda * self.r_corners[i]
                 G = self.Q + mu * self.s_corners[i]
                 corners_3d[i] = (F + G) / 2
+            
             H = np.mean(corners_3d, axis=0)
 
-            v_width = corners_3d[1] - corners_3d[0]
+            # --- AJOUT : LE Z-OFFSET ---
+            # On abaisse le centre mathématique de 15 cm pour anticiper 
+            # l'inclinaison du drone et s'assurer qu'il passe au milieu du vide.
+            z_offset = 0.1
+            H[2] = H[2] - z_offset
+            # ---------------------------
 
+            v_width = corners_3d[1] - corners_3d[0]
             dx_normal = -v_width[1]
             dy_normal = v_width[0]
             gate_yaw = np.arctan2(dy_normal, dx_normal)
             
+            # La suite de ton code reste inchangée...
             gate_index = self.curr_gate_index
             self.gate_pos[gate_index,:] = [H[0], H[1], H[2], gate_yaw] # Assuming yaw of gate is 0, you can change this if you have a different method to estimate the gate's yaw
 
             self.gate_corner[gate_index, :] = corners_3d
 
+            # ... (Début de COMPUTE_GATE_POS inchangé)
             self.curr_gate_index += 1
 
-            self.x_target = H[0]
-            self.y_target = H[1]
-            self.z_target = H[2]
-            self.yaw_target = gate_yaw
+            # --- MÉMORISATION DES CIBLES ---
+            self.gate_yaw_target = gate_yaw
+            self.gate_z_target = H[2]
+            
+            # On place le point d'approche à 0.8m devant la porte
+            app_dist = 0.6
+            self.app_x = H[0] - app_dist * np.cos(gate_yaw)
+            self.app_y = H[1] - app_dist * np.sin(gate_yaw)
+            
+            # Le point de sortie est à 0.6m derrière la porte
+            exit_dist = 0.6
+            self.exit_x = H[0] + exit_dist * np.cos(gate_yaw)
+            self.exit_y = H[1] + exit_dist * np.sin(gate_yaw)
+
+            # --- LA SPLINE AVEC Z-CLAMP ---
+            v_x = np.cos(gate_yaw) * 1.5 
+            v_y = np.sin(gate_yaw) * 1.5
+            
+            self.cs_x = CubicSpline([0, 1], [sensor_data['x_global'], self.app_x], bc_type=((2, 0.0), (1, v_x)))
+            self.cs_y = CubicSpline([0, 1], [sensor_data['y_global'], self.app_y], bc_type=((2, 0.0), (1, v_y)))
+            
+            # Le Z-Clamp : on force la vitesse verticale à être nulle à l'arrivée (t=1)
+            # bc_type=((2, 0.0), (1, 0.0)) signifie : 
+            # - A t=0, l'accélération (dérivée seconde) est nulle (naturel).
+            # - A t=1, la vitesse (dérivée première) est forcée à 0.0.
+            self.cs_z = CubicSpline([0, 1], [sensor_data['z_global'], self.gate_z_target], bc_type=((2, 0.0), (1, 0.0)))
+            
+            self.spline_t = 0.0
             self.state = TRAVEL_GATE
-            print(f"Computed gate position: {H}, transitioning to TRAVEL_GATE state")
+            print(f"Spline d'approche (avec Z-Clamp) calculée ! Début du vol...")
 
         
         if self.state == TRAVEL_GATE:
-            if self.is_approching_gate:
-                self.x_target = self.gate_pos[self.curr_gate_index-1,0] - self.approach_distance * np.cos(self.gate_pos[self.curr_gate_index-1,3])
-                self.y_target = self.gate_pos[self.curr_gate_index-1,1] - self.approach_distance * np.sin(self.gate_pos[self.curr_gate_index-1,3])
-                self.z_target = self.gate_pos[self.curr_gate_index-1,2]
-                self.yaw_target = self.gate_pos[self.curr_gate_index-1,3]
+            
+            # Vitesse de parcours de la courbe
+            vitesse_globale = 0.8 # Un peu plus rapide que 0.5, mais raisonnable
+            self.spline_t += vitesse_globale * dt
+            
+            # --- PHASE 1 : L'APPROCHE EN SPLINE (t = 0 à 1.0) ---
+            if self.spline_t <= 1.0:
+                self.x_target = float(self.cs_x(self.spline_t))
+                self.y_target = float(self.cs_y(self.spline_t))
+                self.z_target = float(self.cs_z(self.spline_t)) # Le Z-clamp agit ici
+                
+                # Le drone tourne le nez dans le sens du virage
+                dx = float(self.cs_x(self.spline_t, 1)) 
+                dy = float(self.cs_y(self.spline_t, 1))
+                self.yaw_target = np.arctan2(dy, dx)
+            
+            # --- PHASE 2 : STABILISATION DEVANT LA PORTE (t = 1.0 à 1.5) ---
+            # On fige le drone sur le point d'approche pendant 0.5 seconde.
+            # Il est déjà à la bonne hauteur grâce au Z-clamp.
+            elif self.spline_t <= 1.5:
+                self.x_target = self.app_x
+                self.y_target = self.app_y
+                self.z_target = self.gate_z_target
+                self.yaw_target = self.gate_yaw_target
+            
+            # --- PHASE 3 : TRAVERSÉE EN LIGNE DROITE (t > 1.5) ---
             else:
-                self.x_target = self.gate_pos[self.curr_gate_index-1,0] + self.approach_distance * np.cos(self.gate_pos[self.curr_gate_index-1,3])
-                self.y_target = self.gate_pos[self.curr_gate_index-1,1] + self.approach_distance * np.sin(self.gate_pos[self.curr_gate_index-1,3])
-                self.z_target = self.gate_pos[self.curr_gate_index-1,2]
-                self.yaw_target = self.gate_pos[self.curr_gate_index-1,3]
-            if np.linalg.norm(np.array([sensor_data['x_global'] - self.x_target, sensor_data['y_global'] - self.y_target, sensor_data['z_global'] - self.z_target])) < 0.1:
-                if self.is_approching_gate:
-                    self.is_approching_gate = False
-                    print("Reached approach position, now passing through the gate")
-                elif self.curr_gate_index < 5:
-                    self.state = DETECT_1
-                    self.is_approching_gate = True
-                    self.yaw_target = sensor_data['yaw']
-                    print("Reached gate position, transitioning back to DETECT_1 state for next gate")
-                else:
-                    self.state = COMPUTE_PATH
-                    print("Reached final gate position, transitioning to COMPUTE_PATH state")
-
+                self.x_target = self.exit_x
+                self.y_target = self.exit_y
+                self.z_target = self.gate_z_target
+                self.yaw_target = self.gate_yaw_target
+                
+                # --- VÉRIFICATION SPATIALE INFALLIBLE ---
+                dist_to_exit = np.linalg.norm(np.array([
+                    sensor_data['x_global'] - self.exit_x,
+                    sensor_data['y_global'] - self.exit_y,
+                    sensor_data['z_global'] - self.gate_z_target
+                ]))
+                
+                if dist_to_exit < 0.2:
+                    print(f"Porte franchie ! Distance: {dist_to_exit:.2f}m")
+                    
+                    self.stop_x = sensor_data['x_global']
+                    self.stop_y = sensor_data['y_global']
+                    
+                    if self.curr_gate_index < 5:
+                        self.state = DETECT_1
+                        self.yaw_target = sensor_data['yaw']
+                    else:
+                        self.state = COMPUTE_PATH
+                        
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
         
         if self.state == COMPUTE_PATH:
@@ -460,7 +588,69 @@ class MyAssignment:
             self.y_target = self.racing_waypoints[0][1]
             self.z_target = self.racing_waypoints[0][2]
             self.yaw_target = self.racing_waypoints[0][3]
-            
+            if self.show_plot:
+                # Plot detected gates (position + orientation) and start point
+                is_main_thread = threading.current_thread() is threading.main_thread()
+                if is_main_thread:
+                    fig, ax = plt.subplots(figsize=(8, 8))
+                else:
+                    fig = Figure(figsize=(8, 8))
+                    FigureCanvas(fig)
+                    ax = fig.add_subplot(111)
+
+                # Use only initialized gates if needed
+                gate_indices = [i for i in range(5) if np.linalg.norm(self.gate_pos[i, :3]) > 1e-9]
+                if len(gate_indices) == 0:
+                    gate_indices = list(range(5))
+
+                gx = self.gate_pos[gate_indices, 0]
+                gy = self.gate_pos[gate_indices, 1]
+                gyaw = self.gate_pos[gate_indices, 3]
+
+                # Rotate map content 90 degrees counterclockwise within the 8x8 arena.
+                gx_rot = 8.0 - gy
+                gy_rot = gx
+
+                # Gate centers
+                ax.scatter(gx_rot, gy_rot, c="magenta", s=70, label="Gates")
+
+                # Orientation arrows
+                u = np.cos(gyaw)
+                v = np.sin(gyaw)
+                u_rot = -v
+                v_rot = u
+                ax.quiver(gx_rot, gy_rot, u_rot, v_rot, angles="xy", scale_units="xy", scale=4, color="purple", width=0.004)
+
+                # Gate labels
+                for k, i in enumerate(gate_indices):
+                    ax.text(gx_rot[k] + 0.05, gy_rot[k] + 0.05, f"G{i+1}", color="black", fontsize=9)
+
+                # Start point
+                start_x_rot = 8.0 - self.start_y
+                start_y_rot = self.start_x
+                ax.scatter(start_x_rot, start_y_rot, c="green", marker="*", s=160, label="Start")
+                ax.text(start_x_rot + 0.05, start_y_rot + 0.05, "Start", color="green", fontsize=9)
+
+                ax.set_title("Gate positions and orientations")
+                ax.set_xlabel("X [m]")
+                ax.set_ylabel("Y [m]")
+                ax.set_xlim(0, 8)
+                ax.set_ylim(0, 8)
+                ax.axis("equal")
+                ax.grid(True)
+                ax.legend()
+                fig.tight_layout()
+                if is_main_thread:
+                    plt.show(block=False)
+                    # plt.pause(0.001)
+                else:
+                    plot_path = os.path.join(os.path.dirname(__file__), "race_gates_plot.png")
+                    fig.savefig(plot_path, dpi=150)
+                    print(f"Plot saved to {plot_path} (GUI disabled in planner thread)")
+                if is_main_thread:
+                    plt.close(fig)
+            else:
+                print("Plotting disabled (show_plot=False)")
             self.state = RACE
             print("Computed racing path, transitioning to RACE state")
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
@@ -488,64 +678,7 @@ class MyAssignment:
                         print(f"Reached waypoint {self.racing_waypoint_index}, moving to next waypoint")
                     else:
                         print("Reached final waypoint, race completed")
-                        if self.show_plot:
-                            # Plot detected gates (position + orientation) and start point
-                            is_main_thread = threading.current_thread() is threading.main_thread()
-                            if is_main_thread:
-                                import matplotlib.pyplot as plt
-                                fig, ax = plt.subplots(figsize=(7, 7))
-                            else:
-                                from matplotlib.figure import Figure
-                                from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
-                                fig = Figure(figsize=(7, 7))
-                                FigureCanvas(fig)
-                                ax = fig.add_subplot(111)
-
-                            # Use only initialized gates if needed
-                            gate_indices = [i for i in range(5) if np.linalg.norm(self.gate_pos[i, :3]) > 1e-9]
-                            if len(gate_indices) == 0:
-                                gate_indices = list(range(5))
-
-                            gx = self.gate_pos[gate_indices, 0]
-                            gy = self.gate_pos[gate_indices, 1]
-                            gyaw = self.gate_pos[gate_indices, 3]
-
-                            # Gate centers
-                            ax.scatter(gx, gy, c="magenta", s=70, label="Gates")
-
-                            # Orientation arrows
-                            u = np.cos(gyaw)
-                            v = np.sin(gyaw)
-                            ax.quiver(gx, gy, u, v, angles="xy", scale_units="xy", scale=4, color="purple", width=0.004)
-
-                            # Gate labels
-                            for k, i in enumerate(gate_indices):
-                                ax.text(gx[k] + 0.05, gy[k] + 0.05, f"G{i+1}", color="black", fontsize=9)
-
-                            # Start point
-                            ax.scatter(self.start_x, self.start_y, c="green", marker="*", s=160, label="Start")
-                            ax.text(self.start_x + 0.05, self.start_y + 0.05, "Start", color="green", fontsize=9)
-
-                            ax.set_title("Gate positions and orientations")
-                            ax.set_xlabel("X [m]")
-                            ax.set_ylabel("Y [m]")
-                            ax.set_xlim(0, 8)
-                            ax.set_ylim(0, 8)
-                            ax.axis("equal")
-                            ax.grid(True)
-                            ax.legend()
-                            fig.tight_layout()
-                            if is_main_thread:
-                                plt.show(block=False)
-                                # plt.pause(0.001)
-                            else:
-                                plot_path = os.path.join(os.path.dirname(__file__), "race_gates_plot.png")
-                                fig.savefig(plot_path, dpi=150)
-                                print(f"Plot saved to {plot_path} (GUI disabled in planner thread)")
-                            if is_main_thread:
-                                plt.close(fig)
-                        else:
-                            print("Plotting disabled (show_plot=False)")
+                        
 
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
 
