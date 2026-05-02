@@ -967,7 +967,7 @@ class MyAssignment:
             if self.state == RACE:
                 max_carrot_dist = 0.80  # RAPIDE : Le drone peut "tirer" jusqu'à 80cm d'un coup
             else:
-                max_carrot_dist = 0.5  # LENT : Le drone avance doucement (15cm) pendant la détection
+                max_carrot_dist = 0.3  # LENT : Le drone avance doucement (15cm) pendant la détection
             
             cmd_x, cmd_y, cmd_z, cmd_yaw = control_command
             
