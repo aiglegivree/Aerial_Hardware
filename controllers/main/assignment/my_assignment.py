@@ -51,7 +51,7 @@ class MyAssignment:
         self.start_yaw = 0
         self.gate_pos = np.zeros((5, 4)) 
         self.gate_corner = np.zeros((5, 4, 3)) 
-        self.yaw_rate = np.pi/4 
+        self.yaw_rate = np.pi/6
         self.req_frames = 5
         self.frames_detected = 0
 
@@ -99,11 +99,14 @@ class MyAssignment:
 
         self.app_x = 0.0
         self.app_y = 0.0
+        self.mid_x = 0.0 # NOUVEAU
+        self.mid_y = 0.0 # NOUVEAU
         self.exit_x = 0.0
         self.exit_y = 0.0
         self.gate_yaw_target = 0.0
         self.gate_z_target = 0.0
-
+        
+        self.travel_phase = 0 # NOUVEAU : 0=Approche, 1=Centre, 2=Sortie
         self.curr_gate_index = 0
         self.expected_cadrans = [4, 2, 0, 10, 8]
 
@@ -607,79 +610,81 @@ class MyAssignment:
             self.curr_gate_index += 1
 
             # --- MÉMORISATION DES CIBLES ---
+           # --- MÉMORISATION DES CIBLES ---
             self.gate_yaw_target = gate_yaw
             self.gate_z_target = H[2]
             
-            # On place le point d'approche à 0.8m devant la porte
-            app_dist = 0.6
+            # Point d'approche à 0.5m
+            app_dist = 0.5
             self.app_x = H[0] - app_dist * np.cos(gate_yaw)
             self.app_y = H[1] - app_dist * np.sin(gate_yaw)
             
-            # Le point de sortie est à 0.6m derrière la porte
-            exit_dist = 0.6
+            # Centre de la porte
+            self.mid_x = H[0]
+            self.mid_y = H[1]
+            
+            # Point de sortie à 0.5m
+            exit_dist = 0.5
             self.exit_x = H[0] + exit_dist * np.cos(gate_yaw)
             self.exit_y = H[1] + exit_dist * np.sin(gate_yaw)
 
-            # --- LA SPLINE AVEC Z-CLAMP ---
-            v_x = np.cos(gate_yaw) * 1.5 
-            v_y = np.sin(gate_yaw) * 1.5
-            
-            self.cs_x = CubicSpline([0, 1], [sensor_data['x_global'], self.app_x], bc_type=((2, 0.0), (1, v_x)))
-            self.cs_y = CubicSpline([0, 1], [sensor_data['y_global'], self.app_y], bc_type=((2, 0.0), (1, v_y)))
-            
-            # Le Z-Clamp : on force la vitesse verticale à être nulle à l'arrivée (t=1)
-            # bc_type=((2, 0.0), (1, 0.0)) signifie : 
-            # - A t=0, l'accélération (dérivée seconde) est nulle (naturel).
-            # - A t=1, la vitesse (dérivée première) est forcée à 0.0.
-            self.cs_z = CubicSpline([0, 1], [sensor_data['z_global'], self.gate_z_target], bc_type=((2, 0.0), (1, 0.0)))
-            
-            self.spline_t = 0.0
+            # --- ON SUPPRIME LES SPLINES ICI ---
+            self.travel_phase = 0
             self.state = TRAVEL_GATE
-            self.terminal_print(f"Spline d'approche (avec Z-Clamp) calculée ! Début du vol...")
+            self.terminal_print("Passage géométrique strict calculé ! Début du vol...")
+            
+            control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
 
-        
         if self.state == TRAVEL_GATE:
             
-            # Vitesse de parcours de la courbe
-            vitesse_globale = 0.8 # Un peu plus rapide que 0.5, mais raisonnable
-            self.spline_t += vitesse_globale * dt
-            
-            # --- PHASE 1 : L'APPROCHE EN SPLINE (t = 0 à 1.0) ---
-            if self.spline_t <= 1.0:
-                self.x_target = float(self.cs_x(self.spline_t))
-                self.y_target = float(self.cs_y(self.spline_t))
-                self.z_target = float(self.cs_z(self.spline_t)) # Le Z-clamp agit ici
-                
-                # Le drone tourne le nez dans le sens du virage
-                dx = float(self.cs_x(self.spline_t, 1)) 
-                dy = float(self.cs_y(self.spline_t, 1))
-                self.yaw_target = np.arctan2(dy, dx)
-            
-            # --- PHASE 2 : STABILISATION DEVANT LA PORTE (t = 1.0 à 1.5) ---
-            # On fige le drone sur le point d'approche pendant 0.5 seconde.
-            # Il est déjà à la bonne hauteur grâce au Z-clamp.
-            elif self.spline_t <= 1.5:
+            # --- PHASE 0 : VOLER VERS L'APPROCHE (0.5m devant) ---
+            if self.travel_phase == 0:
                 self.x_target = self.app_x
                 self.y_target = self.app_y
                 self.z_target = self.gate_z_target
+                self.yaw_target = self.gate_yaw_target 
+                
+                dist_to_app = np.linalg.norm([
+                    sensor_data['x_global'] - self.app_x,
+                    sensor_data['y_global'] - self.app_y,
+                    sensor_data['z_global'] - self.gate_z_target
+                ])
+                
+                if dist_to_app < 0.20: # Dès qu'on est très proche, on vise le milieu
+                    self.travel_phase = 1
+                    
+            # --- PHASE 1 : FRANCHISSEMENT (Vers le milieu exact) ---
+            elif self.travel_phase == 1:
+                self.x_target = self.mid_x
+                self.y_target = self.mid_y
+                self.z_target = self.gate_z_target
                 self.yaw_target = self.gate_yaw_target
-            
-            # --- PHASE 3 : TRAVERSÉE EN LIGNE DROITE (t > 1.5) ---
-            else:
+                
+                dist_to_mid = np.linalg.norm([
+                    sensor_data['x_global'] - self.mid_x,
+                    sensor_data['y_global'] - self.mid_y,
+                    sensor_data['z_global'] - self.gate_z_target
+                ])
+                
+                if dist_to_mid < 0.20: # On a passé le cadre, on vise la sortie
+                    self.travel_phase = 2
+                    
+            # --- PHASE 2 : DÉGAGEMENT (0.5m derrière) ---
+            elif self.travel_phase == 2:
                 self.x_target = self.exit_x
                 self.y_target = self.exit_y
                 self.z_target = self.gate_z_target
                 self.yaw_target = self.gate_yaw_target
                 
-                # --- VÉRIFICATION SPATIALE INFALLIBLE ---
-                dist_to_exit = np.linalg.norm(np.array([
+                dist_to_exit = np.linalg.norm([
                     sensor_data['x_global'] - self.exit_x,
                     sensor_data['y_global'] - self.exit_y,
                     sensor_data['z_global'] - self.gate_z_target
-                ]))
+                ])
                 
-                if dist_to_exit < 0.2:
-                    self.terminal_print(f"Porte franchie ! Distance: {dist_to_exit:.2f}m")
+                # On s'assure d'avoir bien dégagé la porte !
+                if dist_to_exit < 0.20:
+                    self.terminal_print("Porte franchie en phase de détection !")
                     
                     self.stop_x = sensor_data['x_global']
                     self.stop_y = sensor_data['y_global']
@@ -833,10 +838,15 @@ class MyAssignment:
 
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
                 
-        if self.state not in [HOVER, RACE, TRAVEL_GATE, COMPUTE_GATE_POS, COMPUTE_PATH]:
+        # --- LISSAGE DE LA POSITION (Carrot-on-a-stick) ---
+        # On ne lisse pas si on est en HOVER (on veut monter direct) ou en COMPUTE (calculs en cours)
+        if self.state not in [HOVER, COMPUTE_GATE_POS, COMPUTE_PATH]:
             
-            # La "longueur du bâton" de la carotte (en mètres)
-            max_carrot_dist = 0.35 
+            # 1. On définit la vitesse globale en fonction de l'état
+            if self.state == RACE:
+                max_carrot_dist = 0.80  # RAPIDE : Le drone peut "tirer" jusqu'à 80cm d'un coup
+            else:
+                max_carrot_dist = 0.2  # LENT : Le drone avance doucement (15cm) pendant la détection
             
             cmd_x, cmd_y, cmd_z, cmd_yaw = control_command
             
@@ -844,19 +854,18 @@ class MyAssignment:
             curr_y = sensor_data['y_global']
             curr_z = sensor_data['z_global']
             
-            # --- LISSAGE DE LA POSITION (X, Y, Z) UNIQUEMENT ---
             dx = cmd_x - curr_x
             dy = cmd_y - curr_y
             dz = cmd_z - curr_z
             
             dist = np.linalg.norm([dx, dy, dz])
             
+            # 2. Application du lissage
             if dist > max_carrot_dist:
                 cmd_x = curr_x + (dx / dist) * max_carrot_dist
                 cmd_y = curr_y + (dy / dist) * max_carrot_dist
                 cmd_z = curr_z + (dz / dist) * max_carrot_dist
                 
-            # On ré-assemble avec le yaw tel qu'il a été demandé (sans limite)
             control_command = [cmd_x, cmd_y, cmd_z, cmd_yaw]
 
         return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
