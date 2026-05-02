@@ -54,6 +54,7 @@ class MyAssignment:
         self.yaw_rate = np.pi/6
         self.req_frames = 5
         self.frames_detected = 0
+        self.dynamic_z = 1.15
 
         # --- Variables de recherche ---
         self.yaw_accumulated = 0.0          
@@ -109,6 +110,9 @@ class MyAssignment:
         self.travel_phase = 0 # NOUVEAU : 0=Approche, 1=Centre, 2=Sortie
         self.curr_gate_index = 0
         self.expected_cadrans = [4, 2, 0, 10, 8]
+
+        self.est_gate_pos_2d = np.zeros((5, 2))
+        self.est_gate_pos_2d_bis = np.zeros((5, 2))
 
         self.racing_waypoints = []
         self.racing_waypoint_index = 0
@@ -212,7 +216,8 @@ class MyAssignment:
                     is_dangerously_close = True
                     is_partially_occluded = False # On annule l'occlusion pour forcer l'algo
 
-                _,_,_,h = cv2.boundingRect(tallest_contour)
+                x,y,w,h = cv2.boundingRect(tallest_contour)
+                u_c = x + w/2.0
 
                 if contour_area > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
                     
@@ -233,9 +238,12 @@ class MyAssignment:
                         drone_x = sensor_data['x_global']
                         drone_y = sensor_data['y_global']
                         drone_yaw = sensor_data['yaw']
+
+                        angle_offset = np.arctan2((u_c - W / 2.0), focal_length)
+                        est_gate_yaw = drone_yaw - angle_offset
                         
-                        est_gate_x = drone_x + estimated_distance * np.cos(drone_yaw)
-                        est_gate_y = drone_y + estimated_distance * np.sin(drone_yaw)
+                        est_gate_x = drone_x + estimated_distance * np.cos(est_gate_yaw)
+                        est_gate_y = drone_y + estimated_distance * np.sin(est_gate_yaw)
                         
                         center_x, center_y = 4.0, 4.0
                         angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
@@ -252,11 +260,29 @@ class MyAssignment:
                             self.yaw_accumulated = 0.0
                             self.is_vertical_search_active = False
                             
+                            self.est_gate_pos_2d[self.curr_gate_index, 0] = est_gate_x
+                            self.est_gate_pos_2d[self.curr_gate_index, 1] = est_gate_y
+
                             gate_in_sight = True 
                             
                             self.look_at_x = est_gate_x
                             self.look_at_y = est_gate_y
                             self.current_estimated_dist = estimated_distance
+
+                            v_c = y + h / 2.0  # Centre vertical de la porte en pixels
+                            center_y = H / 2.0 # Centre vertical de l'image (H = hauteur de l'image)
+                            
+                            # On ajuste doucement l'altitude cible
+                            # Attention: dans OpenCV, Y=0 est tout en haut de l'image !
+                            if v_c < center_y - 20: 
+                                # La porte est dans le haut de l'image -> Le drone doit MONTER
+                                self.dynamic_z = sensor_data['z_global'] + 0.1 
+                            elif v_c > center_y + 20:
+                                # La porte est dans le bas de l'image -> Le drone doit DESCENDRE
+                                self.dynamic_z = sensor_data['z_global'] - 0.1
+                            else:
+                                # La porte est bien centrée
+                                self.dynamic_z = sensor_data['z_global']
 
                             if self.stop_x is None: 
                                 self.stop_x = sensor_data['x_global']
@@ -318,7 +344,7 @@ class MyAssignment:
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
                 
             elif gate_in_sight:
-                control_command = [self.stop_x, self.stop_y, sensor_data['z_global'], self.yaw_target]
+                control_command = [self.stop_x, self.stop_y, self.dynamic_z, self.yaw_target]
                 
             else:
                 self.stop_x = None
@@ -441,6 +467,8 @@ class MyAssignment:
                     is_dangerously_close = True
                     is_partially_occluded = False
 
+                u_c = x + w / 2.0 # NOUVEAU
+
                 if contour_area > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
                     
                     if is_dangerously_close:
@@ -461,8 +489,13 @@ class MyAssignment:
                         drone_y = sensor_data['y_global']
                         drone_yaw = sensor_data['yaw']
                         
-                        est_gate_x = drone_x + estimated_distance * np.cos(drone_yaw)
-                        est_gate_y = drone_y + estimated_distance * np.sin(drone_yaw)
+                        # --- NOUVEAU : Correction de l'angle ---
+                        angle_offset = np.arctan2((u_c - W / 2.0), focal_length)
+                        est_gate_yaw = drone_yaw - angle_offset
+                        
+                        est_gate_x = drone_x + estimated_distance * np.cos(est_gate_yaw)
+                        est_gate_y = drone_y + estimated_distance * np.sin(est_gate_yaw)
+                        # ---------------------------------------
                         
                         center_x, center_y = 4.0, 4.0
                         angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
@@ -478,13 +511,28 @@ class MyAssignment:
                         if angle_diff <= 45.0:
                             self.yaw_accumulated = 0.0
                             self.is_vertical_search_active = False
+
+                            self.est_gate_pos_2d_bis[self.curr_gate_index, 0] = est_gate_x
+                            self.est_gate_pos_2d_bis[self.curr_gate_index, 1] = est_gate_y
                             
+                            gate_in_sight = True 
+                            
+                            # --- NOUVEAU : Z-Tracking ---
+                            v_c = y + h / 2.0  # Centre vertical de la porte en pixels
+                            center_y_img = H / 2.0 # Centre vertical de l'image
+                            
+                            if v_c < center_y_img - 20: 
+                                self.dynamic_z = sensor_data['z_global'] + 0.1 
+                            elif v_c > center_y_img + 20:
+                                self.dynamic_z = sensor_data['z_global'] - 0.1
+                            else:
+                                self.dynamic_z = sensor_data['z_global']
+                            # ----------------------------
+
                             if self.stop_x is None: 
                                 self.stop_x = sensor_data['x_global']
                                 self.stop_y = sensor_data['y_global']
                                 
-                            gate_in_sight = True 
-                            
                             global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
                             if global_speed < 0.1: 
                                 
@@ -519,6 +567,59 @@ class MyAssignment:
                     self.frames_detected = 0 
             else:
                 self.frames_detected = 0 
+                        
+            if self.state == TRAVEL_GATE:
+                control_command = [self.exit_x, self.exit_y, self.gate_z_target, self.gate_yaw_target]
+            elif gate_valid:
+                self.state = COMPUTE_GATE_POS
+                self.terminal_print("Gate 2 detected and validated, transitioning to COMPUTE_GATE_POS")
+                self.stop_x = None 
+                self.stop_y = None
+                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
+            elif gate_in_sight:
+                # --- NOUVEAU : Application du dynamic_z ---
+                control_command = [self.stop_x, self.stop_y, self.dynamic_z, self.yaw_target]
+            else:
+                self.stop_x = None
+                self.stop_y = None
+                
+                if not self.is_repositioning:
+                    self.yaw_target += self.yaw_rate * dt
+                    self.yaw_accumulated += self.yaw_rate * dt
+                    
+                    if self.yaw_accumulated >= 2 * np.pi:
+                        self.is_vertical_search_active = True
+                    
+                    if self.yaw_accumulated >= 4 * np.pi:
+                        self.terminal_print("Angle mort détecté. Déplacement de secours de 1.5m.")
+                        self.is_repositioning = True
+                        
+                        current_yaw = sensor_data['yaw']
+                        self.reposition_target_x = sensor_data['x_global'] + 1.5 * np.cos(current_yaw)
+                        self.reposition_target_y = sensor_data['y_global'] + 1.5 * np.sin(current_yaw)
+                        
+                        self.yaw_accumulated = 0.0
+                        self.is_vertical_search_active = False
+
+                    z_cmd = 1.15
+                    if self.is_vertical_search_active:
+                        if abs(sensor_data['z_global'] - self.vertical_search_target) < 0.1:
+                            self.vertical_search_target = 0.7 if self.vertical_search_target == 2.0 else 2.0
+                        z_cmd = self.vertical_search_target
+                        
+                    control_command = [sensor_data['x_global'], sensor_data['y_global'], z_cmd, self.yaw_target]
+                
+                else:
+                    control_command = [self.reposition_target_x, self.reposition_target_y, sensor_data['z_global'], self.yaw_target]
+                    
+                    dist_to_repo = np.linalg.norm([
+                        sensor_data['x_global'] - self.reposition_target_x, 
+                        sensor_data['y_global'] - self.reposition_target_y
+                    ])
+                    
+                    if dist_to_repo < 0.2:
+                        self.terminal_print("Nouveau point d'observation atteint. Reprise du scan.")
+                        self.is_repositioning = False
                         
             if self.state == TRAVEL_GATE:
                 control_command = [self.exit_x, self.exit_y, self.gate_z_target, self.gate_yaw_target]
@@ -591,7 +692,7 @@ class MyAssignment:
             # --- AJOUT : LE Z-OFFSET ---
             # On abaisse le centre mathématique de 15 cm pour anticiper 
             # l'inclinaison du drone et s'assurer qu'il passe au milieu du vide.
-            z_offset = 0.1
+            z_offset = 0.0
             H[2] = H[2] - z_offset
             # ---------------------------
 
@@ -770,6 +871,26 @@ class MyAssignment:
                 # Gate centers
                 ax.scatter(gx_rot, gy_rot, c="magenta", s=70, label="Gates")
 
+                est_x = self.est_gate_pos_2d[gate_indices, 0]
+                est_y = self.est_gate_pos_2d[gate_indices, 1]
+                
+                # On applique la même rotation que pour le reste de la carte
+                est_x_rot = 8.0 - est_y
+                est_y_rot = est_x
+                
+                # On dessine les estimations sous forme de croix oranges
+                ax.scatter(est_x_rot, est_y_rot, c="orange", marker="x", s=60, label="Estimated Gates (2D)")
+
+                est_x_bis = self.est_gate_pos_2d_bis[gate_indices, 0]
+                est_y_bis = self.est_gate_pos_2d_bis[gate_indices, 1]
+
+                # On applique la même rotation que pour le reste de la carte
+                est_x_rot_bis = 8.0 - est_y_bis
+                est_y_rot_bis = est_x_bis
+                
+                # On dessine les estimations sous forme de croix oranges
+                ax.scatter(est_x_rot_bis, est_y_rot_bis, c="red", marker="x", s=60, label="Estimated Gates bis (2D)")
+
                 # Orientation arrows
                 u = np.cos(gyaw)
                 v = np.sin(gyaw)
@@ -846,7 +967,7 @@ class MyAssignment:
             if self.state == RACE:
                 max_carrot_dist = 0.80  # RAPIDE : Le drone peut "tirer" jusqu'à 80cm d'un coup
             else:
-                max_carrot_dist = 0.2  # LENT : Le drone avance doucement (15cm) pendant la détection
+                max_carrot_dist = 0.5  # LENT : Le drone avance doucement (15cm) pendant la détection
             
             cmd_x, cmd_y, cmd_z, cmd_yaw = control_command
             
