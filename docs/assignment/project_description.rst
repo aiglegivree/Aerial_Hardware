@@ -38,8 +38,15 @@ Your grade in this simulation exercise will be determined according to the follo
 
 - **Grade 3.5**: Take off
 - **Grade 3.5 - 4.75**: For each gate passed through in the first lap you get + 0.25
-- **Grade 4.75 - 6.0**: Average time over the second and third lap compared to the rest of the class
+- **Grade 4.75 - 6.0**:
+
+  Grades in this range are determined by a ranking based on the following criteria, in order of priority:
+
+  #. **Number of gates correctly detected and passed during the first lap**
+  #. **Total number of gates passed across all three laps**
+  #. **Average completion time of the second and third laps**, compared to the rest of the class
 - Solutions that go against the spirit of the exercise will not be accepted (e.g. finding bugs and exploiting them).
+
 
 Hardware Task overview (group work)
 -----------------------
@@ -47,9 +54,11 @@ Hardware Task overview (group work)
 In the hardware task, you will later work towards transferring your algorithms from simulation onto the real Crazyflie hardware.
 This time you work in a team of 4-5 people.
 
-The hardware arena is similar in structure to the simulation arena but smaller. We will, however, tell you the position of the gates before the start of this task, so no need for computer vision in the Hardware task.
+The hardware arena is similar in structure to the simulation arena but smaller. 
 
 Your grade in this hardware exercise will be determined according to the same **Performance metrics** as in simulation. You will have three trials, the best one counts.
+
+Hardware grading follows the same structure as the simulation task. Each trial starts from a grade of 3.5 after take-off. During the first lap, teams must detect the gates using vision; each gate that is both correctly detected and flown through adds 0.25 points. After this vision-based lap, the exact gate positions will be provided. The remaining score is then determined by the number of gates completed and the completion time of the second and third laps, as in the simulation task.
 
 .. Here is a real-world test example of this project from last year:
 
@@ -80,19 +89,19 @@ The following table provides the schedule of the crazy-practical project.
 
 ==========================  ========================================================
 **Week**                    **Notes**
-| Week 6, March 24          | Project introduction, Simulation development, Q&A
-| Week 7, March 31           | Simulation development, Q&A
-| Week 8, April 14           | Simulation development, Q&A
-| Week 9, April 21          | Simulation development, Q&A
-                            | Simulation due 23:59 May 2, submit code in Moodle
+| Week 6, March 25          | Project introduction, Simulation development, Q&A
+| Week 7, April 1           | Simulation development, Q&A
+| Week 8, April 8           | Simulation development, Q&A
+| Week 9, April 15          | Simulation development, Q&A
+                            | Simulation due 23:59 April 28, submit code in Moodle
                             | Select the hardware group in Moodle
-| Week 10, April 28         | Hardware introduction, pick up your drone by group
-| Week 11, May 5            | Hardware development, Q&A
-| Week 12, May 12           | Hardware development, Q&A
-| Week 13, May 19           | Hardware development, Q&A
-                            .. | Testing runs for hardware demonstrations (May 19nd)
-| Week 14, May 25/26        | Submit hardware task video, Code and Presentation files (due May 25th 23:59)
-                            | Hardware task presentation and final demonstrations, hand in the drones (May 26th)
+| Week 10, April 29         | Hardware introduction, pick up your drone by group
+| Week 11, May 6            | Hardware development, Q&A
+| Week 12, May 13           | Hardware development, Q&A
+| Week 13, May 20           | Hardware development, Q&A
+                            .. | Testing runs for hardware demonstrations (May 22nd)
+| Week 14, May 26/27        | Submit hardware task video, Code and Presentation files (due May 26th 23:59)
+                            | Hardware task presentation and final demonstrations, hand in the drones (May 27th)
 ==========================  ========================================================
 
 Any questions about the task, submission, schedule and grading, please contact Charbel Toumieh (charbel.toumieh@epfl.ch).
