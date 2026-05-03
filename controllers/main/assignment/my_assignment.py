@@ -41,7 +41,8 @@ COMPUTE_PATH = 7
 RACE = 8
 
 
-MIN_HEIGHT_PIXELS = 20
+MIN_HEIGHT_PIXELS = 6    # Au lieu de 20. On accepte une porte qui fait au moins 6 pixels de haut.
+MIN_AREA_PIXELS = 15     # Au lieu de 75. On accepte un tout petit bloc de pixels roses.
 
 class MyAssignment:
     def __init__(self):
@@ -113,6 +114,8 @@ class MyAssignment:
 
         self.est_gate_pos_2d = np.zeros((5, 2))
         self.est_gate_pos_2d_bis = np.zeros((5, 2))
+
+        self.memorized_gate_width = None # NOUVEAU : Mémoire pour contrer l'occlusion
 
         self.racing_waypoints = []
         self.racing_waypoint_index = 0
@@ -194,129 +197,134 @@ class MyAssignment:
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) 
 
             if len(contours) > 0:
-                tallest_contour = max(contours, key=lambda c: cv2.boundingRect(c)[3])
+                sorted_contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[3], reverse=True)
+                
                 H = mask.shape[0]
                 W = mask.shape[1]
-
-                padding = 10
-                touches_top = np.any(mask[:padding, :] > 0)      
-                touches_bottom = np.any(mask[H-padding:, :] > 0)  
-                touches_left = np.any(mask[:, :padding] > 0)      
-                touches_right = np.any(mask[:, W-padding:] > 0)
-                is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
-
-                # --- NOUVEAU : CALCUL DE LA COUVERTURE DE L'ÉCRAN ---
-                screen_area = W * H
-                contour_area = cv2.contourArea(tallest_contour)
-                coverage_ratio = contour_area / screen_area
-
-                # --- NOUVEAU : FORCER LE PASSAGE SI TROP PRÈS ---
-                is_dangerously_close = False
-                if is_partially_occluded and coverage_ratio > 0.60: 
-                    is_dangerously_close = True
-                    is_partially_occluded = False # On annule l'occlusion pour forcer l'algo
-
-                x,y,w,h = cv2.boundingRect(tallest_contour)
-                u_c = x + w/2.0
-
-                if contour_area > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
+                focal_length = 161.013922282
+                real_height = 0.4
+                pitch_angle = abs(sensor_data['pitch'])
+                valid_contour = None
+                
+                for c in sorted_contours:
+                    x, y, w, h = cv2.boundingRect(c)
+                    contour_area = cv2.contourArea(c)
                     
+                    if contour_area <= MIN_AREA_PIXELS or h <= MIN_HEIGHT_PIXELS:
+                        continue
+                        
+                    padding = 10
+                    touches_top = (y < padding)
+                    touches_bottom = (y + h > H - padding)
+                    touches_left = (x < padding)
+                    touches_right = (x + w > W - padding)
+                    is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
+                    
+                    screen_area = W * H
+                    coverage_ratio = contour_area / screen_area
+                    is_dangerously_close = False
+                    if is_partially_occluded and coverage_ratio > 0.60:
+                        is_dangerously_close = True
+                        is_partially_occluded = False
+                        
+                    if is_partially_occluded:
+                        continue 
+                        
+                    h_corrige = h / max(np.cos(pitch_angle), 0.1)
+                    estimated_distance = (focal_length * real_height) / h_corrige
+                    
+                    u_c = x + w/2.0
+                    drone_x = sensor_data['x_global']
+                    drone_y = sensor_data['y_global']
+                    drone_yaw = sensor_data['yaw']
+
+                    angle_offset = np.arctan2((u_c - W / 2.0), focal_length)
+                    est_gate_yaw = drone_yaw - angle_offset
+                    
+                    est_gate_x = drone_x + estimated_distance * np.cos(est_gate_yaw)
+                    est_gate_y = drone_y + estimated_distance * np.sin(est_gate_yaw)
+                    
+                    center_x, center_y = 4.0, 4.0
+                    angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
+                    angle_deg = np.degrees(angle_rad)
+                    
+                    clock_angle = (360 - angle_deg + 15) % 360
+                    expected_center_angle = self.expected_cadrans[self.curr_gate_index] * 30 + 15
+                    
+                    angle_diff = abs(clock_angle - expected_center_angle)
+                    angle_diff = min(angle_diff, 360 - angle_diff)
+                    
+                    if angle_diff <= 45.0:
+                        valid_contour = c
+                        best_x, best_y, best_w, best_h = x, y, w, h
+                        best_dist = estimated_distance
+                        best_est_x, best_est_y = est_gate_x, est_gate_y
+                        best_danger = is_dangerously_close
+                        break 
+                        
+                if valid_contour is not None:
+                    tallest_contour = valid_contour
+                    x, y, w, h = best_x, best_y, best_w, best_h
+                    estimated_distance = best_dist
+                    est_gate_x, est_gate_y = best_est_x, best_est_y
+                    is_dangerously_close = best_danger
+                       
                     if is_dangerously_close:
                         self.terminal_print("DANGER PROXIMITÉ 1 : Traversée forcée !")
-                        self.state = TRAVEL_GATE # On saute toute l'approche latérale
+                        self.state = TRAVEL_GATE 
                         yaw = sensor_data['yaw']
                         self.exit_x = sensor_data['x_global'] + 1.5 * np.cos(yaw)
                         self.exit_y = sensor_data['y_global'] + 1.5 * np.sin(yaw)
                         self.gate_z_target = sensor_data['z_global']
                         self.gate_yaw_target = yaw
-                        self.spline_t = 2.0 # On simule la fin de la spline
+                        self.spline_t = 2.0 
                     else:
-                        focal_length = 161.013922282
-                        real_height = 0.4 
-                        estimated_distance = (focal_length * real_height) / h
+                        self.yaw_accumulated = 0.0
+                        self.is_vertical_search_active = False
                         
-                        drone_x = sensor_data['x_global']
-                        drone_y = sensor_data['y_global']
-                        drone_yaw = sensor_data['yaw']
+                        self.est_gate_pos_2d[self.curr_gate_index, 0] = est_gate_x
+                        self.est_gate_pos_2d[self.curr_gate_index, 1] = est_gate_y
 
-                        angle_offset = np.arctan2((u_c - W / 2.0), focal_length)
-                        est_gate_yaw = drone_yaw - angle_offset
+                        gate_in_sight = True 
                         
-                        est_gate_x = drone_x + estimated_distance * np.cos(est_gate_yaw)
-                        est_gate_y = drone_y + estimated_distance * np.sin(est_gate_yaw)
-                        
-                        center_x, center_y = 4.0, 4.0
-                        angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
-                        angle_deg = np.degrees(angle_rad)
-                        
-                        clock_angle = (360 - angle_deg + 15) % 360
-                        expected_cadran = self.expected_cadrans[self.curr_gate_index]
-                        expected_center_angle = expected_cadran * 30 + 15
-                        
-                        angle_diff = abs(clock_angle - expected_center_angle)
-                        angle_diff = min(angle_diff, 360 - angle_diff)
-                        
-                        if angle_diff <= 45.0:
-                            self.yaw_accumulated = 0.0
-                            self.is_vertical_search_active = False
-                            
-                            self.est_gate_pos_2d[self.curr_gate_index, 0] = est_gate_x
-                            self.est_gate_pos_2d[self.curr_gate_index, 1] = est_gate_y
+                        self.look_at_x = est_gate_x
+                        self.look_at_y = est_gate_y
+                        self.current_estimated_dist = estimated_distance
 
-                            gate_in_sight = True 
-                            
-                            self.look_at_x = est_gate_x
-                            self.look_at_y = est_gate_y
-                            self.current_estimated_dist = estimated_distance
-
-                            v_c = y + h / 2.0  # Centre vertical de la porte en pixels
-                            center_y = H / 2.0 # Centre vertical de l'image (H = hauteur de l'image)
-                            
-                            # On ajuste doucement l'altitude cible
-                            # Attention: dans OpenCV, Y=0 est tout en haut de l'image !
-                            if v_c < center_y - 20: 
-                                # La porte est dans le haut de l'image -> Le drone doit MONTER
-                                self.dynamic_z = sensor_data['z_global'] + 0.1 
-                            elif v_c > center_y + 20:
-                                # La porte est dans le bas de l'image -> Le drone doit DESCENDRE
-                                self.dynamic_z = sensor_data['z_global'] - 0.1
-                            else:
-                                # La porte est bien centrée
-                                self.dynamic_z = sensor_data['z_global']
-
-                            if self.stop_x is None: 
-                                self.stop_x = sensor_data['x_global']
-                                self.stop_y = sensor_data['y_global']
-                                
-                            global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
-                            if global_speed < 0.1: 
-                                
-                                self.frames_detected += 1
-                                
-                                if self.frames_detected >= self.req_frames:
-                                    corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
-
-                                    quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
-                                    R_body_to_world = R.from_quat(quaternion).as_matrix()
-                                    R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]])
-
-                                    for i, corner in enumerate(corners_2d_sorted):
-                                        vect_x = corner[0] - camera_data.shape[1]/2
-                                        vect_y = corner[1] - camera_data.shape[0]/2
-                                        vect_z = focal_length
-                                        v_camera = np.array([vect_x, vect_y, vect_z])
-                                        v_body = R_cam_to_body @ v_camera
-                                        self.r_corners[i] = R_body_to_world @ v_body
-
-                                    cam_offset_body = np.array([0.03, 0, 0.01])
-                                    pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
-                                    self.P = pos_drone + (R_body_to_world @ cam_offset_body)
-                                    gate_valid = True
-                                    self.frames_detected = 0 
-                            else:
-                                self.frames_detected = 0
+                        v_c = y + h / 2.0  
+                        center_y_img = H / 2.0 
+                        if v_c < center_y_img - 20: 
+                            self.dynamic_z = sensor_data['z_global'] + 0.1 
+                        elif v_c > center_y_img + 20:
+                            self.dynamic_z = sensor_data['z_global'] - 0.1
                         else:
-                            gate_in_sight = False
+                            self.dynamic_z = sensor_data['z_global']
+                        
+                        if self.stop_x is None: 
+                            self.stop_x = sensor_data['x_global']
+                            self.stop_y = sensor_data['y_global']
+                            
+                        global_speed = np.linalg.norm([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']])
+                        if global_speed < 0.1: 
+                            self.frames_detected += 1
+                            if self.frames_detected >= self.req_frames:
+                                corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
+
+                                quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
+                                R_body_to_world = R.from_quat(quaternion).as_matrix()
+                                R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]])
+
+                                for i, corner in enumerate(corners_2d_sorted):
+                                    v_camera = np.array([corner[0] - W/2, corner[1] - H/2, focal_length])
+                                    self.r_corners[i] = R_body_to_world @ (R_cam_to_body @ v_camera)
+
+                                pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
+                                self.P = pos_drone + (R_body_to_world @ np.array([0.03, 0, 0.01]))
+                                gate_valid = True
+                                
+                                self.memorized_gate_width = (w * estimated_distance) / focal_length
+                                self.frames_detected = 0 
+                        else:
                             self.frames_detected = 0
                 else:
                     self.frames_detected = 0
@@ -325,7 +333,6 @@ class MyAssignment:
 
             # --- TRANSITIONS DETECT 1 ---
             if self.state == TRAVEL_GATE:
-                # Traversée d'urgence déclenchée, on initie la commande
                 control_command = [self.exit_x, self.exit_y, self.gate_z_target, self.gate_yaw_target]
                 
             elif gate_valid:
@@ -350,7 +357,6 @@ class MyAssignment:
                 self.stop_x = None
                 self.stop_y = None
                 
-                # --- NOUVEAU : LA LOGIQUE DE ZONE MORTE (RANDOM WALK) ---
                 if not self.is_repositioning:
                     self.yaw_target += self.yaw_rate * dt
                     self.yaw_accumulated += self.yaw_rate * dt
@@ -358,15 +364,12 @@ class MyAssignment:
                     if self.yaw_accumulated >= 2 * np.pi:
                         self.is_vertical_search_active = True
                     
-                    # Si après 2 tours on ne voit toujours rien : on s'avance !
                     if self.yaw_accumulated >= 4 * np.pi:
                         self.terminal_print("Angle mort détecté. Déplacement de secours de 1.5m.")
                         self.is_repositioning = True
-                        
                         current_yaw = sensor_data['yaw']
                         self.reposition_target_x = sensor_data['x_global'] + 1.5 * np.cos(current_yaw)
                         self.reposition_target_y = sensor_data['y_global'] + 1.5 * np.sin(current_yaw)
-                        
                         self.yaw_accumulated = 0.0
                         self.is_vertical_search_active = False
 
@@ -379,54 +382,14 @@ class MyAssignment:
                     control_command = [sensor_data['x_global'], sensor_data['y_global'], z_cmd, self.yaw_target]
                 
                 else:
-                    # Le drone s'avance pour débloquer la vue
                     control_command = [self.reposition_target_x, self.reposition_target_y, sensor_data['z_global'], self.yaw_target]
-                    
                     dist_to_repo = np.linalg.norm([
                         sensor_data['x_global'] - self.reposition_target_x, 
                         sensor_data['y_global'] - self.reposition_target_y
                     ])
-                    
                     if dist_to_repo < 0.2:
                         self.terminal_print("Nouveau point d'observation atteint. Reprise du scan.")
                         self.is_repositioning = False
-
-            if gate_valid:
-                self.state = LATERAL_TRAVEL
-                
-                lateral_travel = min(1.0, max(0.35, self.current_estimated_dist * 0.25))
-                self.terminal_print(f"Porte détectée à {self.current_estimated_dist:.2f}m. Déplacement latéral de {lateral_travel:.2f}m")
-                
-                yaw = sensor_data['yaw']
-                self.x_target = sensor_data['x_global'] + lateral_travel * np.sin(yaw)
-                self.y_target = sensor_data['y_global'] - lateral_travel * np.cos(yaw)
-                self.z_target = sensor_data['z_global']
-                self.yaw_target = np.arctan2(self.look_at_y - self.y_target, self.look_at_x - self.x_target)
-                
-                self.stop_x = None 
-                self.stop_y = None
-                
-                control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
-                
-            elif gate_in_sight:
-                control_command = [self.stop_x, self.stop_y, sensor_data['z_global'], self.yaw_target]
-            else:
-                self.stop_x = None
-                self.stop_y = None
-                
-                self.yaw_target += self.yaw_rate * dt
-                self.yaw_accumulated += self.yaw_rate * dt
-                
-                if self.yaw_accumulated >= 2 * np.pi:
-                    self.is_vertical_search_active = True
-                
-                z_cmd = 1.15
-                if self.is_vertical_search_active:
-                    if abs(sensor_data['z_global'] - self.vertical_search_target) < 0.1:
-                        self.vertical_search_target = 0.7 if self.vertical_search_target == 2.0 else 2.0
-                    z_cmd = self.vertical_search_target
-                    
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], z_cmd, self.yaw_target]
 
         if self.state == LATERAL_TRAVEL:
             if np.linalg.norm(np.array([sensor_data['x_global'] - self.x_target, sensor_data['y_global'] - self.y_target, sensor_data['z_global'] - self.z_target])) < 0.05:
@@ -446,30 +409,82 @@ class MyAssignment:
             contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE) 
 
             if len(contours) > 0:
-                tallest_contour = max(contours, key=lambda c: cv2.boundingRect(c)[3])
+                sorted_contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[3], reverse=True)
+                
                 H = mask.shape[0]
                 W = mask.shape[1]
+                focal_length = 161.013922282
+                real_height = 0.4
+                pitch_angle = abs(sensor_data['pitch'])
+                valid_contour = None
+                
+                for c in sorted_contours:
+                    x, y, w, h = cv2.boundingRect(c)
+                    contour_area = cv2.contourArea(c)
+                    
+                    if contour_area <= MIN_AREA_PIXELS or h <= MIN_HEIGHT_PIXELS:
+                        continue
+                        
+                    padding = 5
+                    touches_top = (y < padding)
+                    touches_bottom = (y + h > H - padding)
+                    touches_left = (x < padding)
+                    touches_right = (x + w > W - padding)
+                    is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
 
-                padding = 5
-                x, y, w, h = cv2.boundingRect(tallest_contour)
-                touches_top = (y < padding)
-                touches_bottom = (y + h > H - padding)
-                touches_left = (x < padding)
-                touches_right = (x + w > W - padding)
-                is_partially_occluded = touches_top or touches_bottom or touches_left or touches_right
+                    screen_area = W * H
+                    coverage_ratio = contour_area / screen_area
 
-                screen_area = W * H
-                contour_area = cv2.contourArea(tallest_contour)
-                coverage_ratio = contour_area / screen_area
+                    is_dangerously_close = False
+                    if is_partially_occluded and coverage_ratio > 0.60: 
+                        is_dangerously_close = True
+                        is_partially_occluded = False
 
-                is_dangerously_close = False
-                if is_partially_occluded and coverage_ratio > 0.60: 
-                    is_dangerously_close = True
-                    is_partially_occluded = False
+                    h_corrige = h / max(np.cos(pitch_angle), 0.1)
+                    estimated_distance = (focal_length * real_height) / h_corrige
+                    
+                    if self.memorized_gate_width is not None:
+                        largeur_pixels_attendue = (self.memorized_gate_width * focal_length) / estimated_distance
+                        u_c = (x + w) - (largeur_pixels_attendue / 2.0)
+                    else:
+                        u_c = x + w / 2.0
 
-                u_c = x + w / 2.0 # NOUVEAU
-
-                if contour_area > 75 and not is_partially_occluded and h > MIN_HEIGHT_PIXELS:
+                    drone_x = sensor_data['x_global']
+                    drone_y = sensor_data['y_global']
+                    drone_yaw = sensor_data['yaw']
+                    
+                    angle_offset = np.arctan2((u_c - W / 2.0), focal_length)
+                    est_gate_yaw = drone_yaw - angle_offset
+                    
+                    est_gate_x = drone_x + estimated_distance * np.cos(est_gate_yaw)
+                    est_gate_y = drone_y + estimated_distance * np.sin(est_gate_yaw)
+                    
+                    center_x, center_y = 4.0, 4.0
+                    angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
+                    angle_deg = np.degrees(angle_rad)
+                    
+                    clock_angle = (360 - angle_deg + 15) % 360
+                    expected_center_angle = self.expected_cadrans[self.curr_gate_index] * 30 + 15
+                    
+                    angle_diff = abs(clock_angle - expected_center_angle)
+                    angle_diff = min(angle_diff, 360 - angle_diff)
+                    
+                    if angle_diff <= 45.0:
+                        valid_contour = c
+                        best_x, best_y, best_w, best_h = x, y, w, h
+                        best_dist = estimated_distance
+                        best_est_x, best_est_y = est_gate_x, est_gate_y
+                        best_danger = is_dangerously_close
+                        best_u_c = u_c
+                        break
+                        
+                if valid_contour is not None:
+                    tallest_contour = valid_contour
+                    x, y, w, h = best_x, best_y, best_w, best_h
+                    estimated_distance = best_dist
+                    est_gate_x, est_gate_y = best_est_x, best_est_y
+                    is_dangerously_close = best_danger
+                    u_c = best_u_c
                     
                     if is_dangerously_close:
                         self.terminal_print("DANGER PROXIMITÉ 2 : Traversée forcée !")
@@ -481,93 +496,53 @@ class MyAssignment:
                         self.gate_yaw_target = yaw
                         self.spline_t = 2.0 
                     else:
-                        focal_length = 161.013922282
-                        real_height = 0.4 
-                        estimated_distance = (focal_length * real_height) / h
-                        
-                        drone_x = sensor_data['x_global']
-                        drone_y = sensor_data['y_global']
-                        drone_yaw = sensor_data['yaw']
-                        
-                        # --- NOUVEAU : Correction de l'angle ---
-                        angle_offset = np.arctan2((u_c - W / 2.0), focal_length)
-                        est_gate_yaw = drone_yaw - angle_offset
-                        
-                        est_gate_x = drone_x + estimated_distance * np.cos(est_gate_yaw)
-                        est_gate_y = drone_y + estimated_distance * np.sin(est_gate_yaw)
-                        # ---------------------------------------
-                        
-                        center_x, center_y = 4.0, 4.0
-                        angle_rad = np.arctan2(est_gate_y - center_y, est_gate_x - center_x)
-                        angle_deg = np.degrees(angle_rad)
-                        
-                        clock_angle = (360 - angle_deg + 15) % 360
-                        expected_cadran = self.expected_cadrans[self.curr_gate_index]
-                        expected_center_angle = expected_cadran * 30 + 15
-                        
-                        angle_diff = abs(clock_angle - expected_center_angle)
-                        angle_diff = min(angle_diff, 360 - angle_diff)
-                        
-                        if angle_diff <= 45.0:
-                            self.yaw_accumulated = 0.0
-                            self.is_vertical_search_active = False
+                        self.yaw_accumulated = 0.0
+                        self.is_vertical_search_active = False
 
-                            self.est_gate_pos_2d_bis[self.curr_gate_index, 0] = est_gate_x
-                            self.est_gate_pos_2d_bis[self.curr_gate_index, 1] = est_gate_y
-                            
-                            gate_in_sight = True 
-                            
-                            # --- NOUVEAU : Z-Tracking ---
-                            v_c = y + h / 2.0  # Centre vertical de la porte en pixels
-                            center_y_img = H / 2.0 # Centre vertical de l'image
-                            
-                            if v_c < center_y_img - 20: 
-                                self.dynamic_z = sensor_data['z_global'] + 0.1 
-                            elif v_c > center_y_img + 20:
-                                self.dynamic_z = sensor_data['z_global'] - 0.1
-                            else:
-                                self.dynamic_z = sensor_data['z_global']
-                            # ----------------------------
-
-                            if self.stop_x is None: 
-                                self.stop_x = sensor_data['x_global']
-                                self.stop_y = sensor_data['y_global']
-                                
-                            global_speed = np.linalg.norm(np.array([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']]))
-                            if global_speed < 0.1: 
-                                
-                                self.frames_detected += 1
-                                
-                                if self.frames_detected >= self.req_frames:
-                                    corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
-
-                                    quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
-                                    R_body_to_world = R.from_quat(quaternion).as_matrix()
-                                    R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]]) 
-
-                                    for i, corner in enumerate(corners_2d_sorted):
-                                        vect_x = corner[0] - camera_data.shape[1]/2
-                                        vect_y = corner[1] - camera_data.shape[0]/2
-                                        vect_z = focal_length 
-                                        v_camera_2 = np.array([vect_x, vect_y, vect_z])
-                                        v_body_2 = R_cam_to_body @ v_camera_2
-                                        self.s_corners[i] = R_body_to_world @ v_body_2
-
-                                    cam_offset_body = np.array([0.03, 0, 0.01])
-                                    pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
-                                    self.Q = pos_drone + (R_body_to_world @ cam_offset_body)
-                                    gate_valid = True
-                                    self.frames_detected = 0
-                            else:
-                                self.frames_detected = 0 
+                        self.est_gate_pos_2d_bis[self.curr_gate_index, 0] = est_gate_x
+                        self.est_gate_pos_2d_bis[self.curr_gate_index, 1] = est_gate_y
+                        
+                        gate_in_sight = True 
+                        
+                        v_c = y + h / 2.0  
+                        center_y_img = H / 2.0 
+                        if v_c < center_y_img - 20: 
+                            self.dynamic_z = sensor_data['z_global'] + 0.1 
+                        elif v_c > center_y_img + 20:
+                            self.dynamic_z = sensor_data['z_global'] - 0.1
                         else:
-                            gate_in_sight = False
+                            self.dynamic_z = sensor_data['z_global']
+                            
+                        if self.stop_x is None: 
+                            self.stop_x = sensor_data['x_global']
+                            self.stop_y = sensor_data['y_global']
+                            
+                        global_speed = np.linalg.norm([sensor_data['v_x'], sensor_data['v_y'], sensor_data['v_z']])
+                        if global_speed < 0.1: 
+                            self.frames_detected += 1
+                            if self.frames_detected >= self.req_frames:
+                                corners_2d_sorted = self.get_corner_positions_2d_sorted(tallest_contour)
+
+                                quaternion = [sensor_data['q_x'], sensor_data['q_y'], sensor_data['q_z'], sensor_data['q_w']]
+                                R_body_to_world = R.from_quat(quaternion).as_matrix()
+                                R_cam_to_body = np.array([[0,0,1],[-1,0,0],[0,-1,0]]) 
+
+                                for i, corner in enumerate(corners_2d_sorted):
+                                    v_camera_2 = np.array([corner[0] - W/2, corner[1] - H/2, focal_length])
+                                    self.s_corners[i] = R_body_to_world @ (R_cam_to_body @ v_camera_2)
+
+                                pos_drone = np.array([sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global']])
+                                self.Q = pos_drone + (R_body_to_world @ np.array([0.03, 0, 0.01]))
+                                gate_valid = True
+                                self.frames_detected = 0
+                        else:
                             self.frames_detected = 0 
                 else:
                     self.frames_detected = 0 
             else:
                 self.frames_detected = 0 
-                        
+
+            # --- TRANSITIONS DETECT 2 ---
             if self.state == TRAVEL_GATE:
                 control_command = [self.exit_x, self.exit_y, self.gate_z_target, self.gate_yaw_target]
             elif gate_valid:
@@ -577,7 +552,6 @@ class MyAssignment:
                 self.stop_y = None
                 control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
             elif gate_in_sight:
-                # --- NOUVEAU : Application du dynamic_z ---
                 control_command = [self.stop_x, self.stop_y, self.dynamic_z, self.yaw_target]
             else:
                 self.stop_x = None
@@ -593,11 +567,9 @@ class MyAssignment:
                     if self.yaw_accumulated >= 4 * np.pi:
                         self.terminal_print("Angle mort détecté. Déplacement de secours de 1.5m.")
                         self.is_repositioning = True
-                        
                         current_yaw = sensor_data['yaw']
                         self.reposition_target_x = sensor_data['x_global'] + 1.5 * np.cos(current_yaw)
                         self.reposition_target_y = sensor_data['y_global'] + 1.5 * np.sin(current_yaw)
-                        
                         self.yaw_accumulated = 0.0
                         self.is_vertical_search_active = False
 
@@ -611,64 +583,10 @@ class MyAssignment:
                 
                 else:
                     control_command = [self.reposition_target_x, self.reposition_target_y, sensor_data['z_global'], self.yaw_target]
-                    
                     dist_to_repo = np.linalg.norm([
                         sensor_data['x_global'] - self.reposition_target_x, 
                         sensor_data['y_global'] - self.reposition_target_y
                     ])
-                    
-                    if dist_to_repo < 0.2:
-                        self.terminal_print("Nouveau point d'observation atteint. Reprise du scan.")
-                        self.is_repositioning = False
-                        
-            if self.state == TRAVEL_GATE:
-                control_command = [self.exit_x, self.exit_y, self.gate_z_target, self.gate_yaw_target]
-            elif gate_valid:
-                self.state = COMPUTE_GATE_POS
-                self.terminal_print("Gate 2 detected and validated, transitioning to COMPUTE_GATE_POS")
-                self.stop_x = None 
-                self.stop_y = None
-                control_command = [sensor_data['x_global'], sensor_data['y_global'], sensor_data['z_global'], self.yaw_target]
-            elif gate_in_sight:
-                control_command = [self.stop_x, self.stop_y, sensor_data['z_global'], self.yaw_target]
-            else:
-                self.stop_x = None
-                self.stop_y = None
-                
-                if not self.is_repositioning:
-                    self.yaw_target += self.yaw_rate * dt
-                    self.yaw_accumulated += self.yaw_rate * dt
-                    
-                    if self.yaw_accumulated >= 2 * np.pi:
-                        self.is_vertical_search_active = True
-                    
-                    if self.yaw_accumulated >= 4 * np.pi:
-                        self.terminal_print("Angle mort détecté. Déplacement de secours de 1.5m.")
-                        self.is_repositioning = True
-                        
-                        current_yaw = sensor_data['yaw']
-                        self.reposition_target_x = sensor_data['x_global'] + 1.5 * np.cos(current_yaw)
-                        self.reposition_target_y = sensor_data['y_global'] + 1.5 * np.sin(current_yaw)
-                        
-                        self.yaw_accumulated = 0.0
-                        self.is_vertical_search_active = False
-
-                    z_cmd = 1.15
-                    if self.is_vertical_search_active:
-                        if abs(sensor_data['z_global'] - self.vertical_search_target) < 0.1:
-                            self.vertical_search_target = 0.7 if self.vertical_search_target == 2.0 else 2.0
-                        z_cmd = self.vertical_search_target
-                        
-                    control_command = [sensor_data['x_global'], sensor_data['y_global'], z_cmd, self.yaw_target]
-                
-                else:
-                    control_command = [self.reposition_target_x, self.reposition_target_y, sensor_data['z_global'], self.yaw_target]
-                    
-                    dist_to_repo = np.linalg.norm([
-                        sensor_data['x_global'] - self.reposition_target_x, 
-                        sensor_data['y_global'] - self.reposition_target_y
-                    ])
-                    
                     if dist_to_repo < 0.2:
                         self.terminal_print("Nouveau point d'observation atteint. Reprise du scan.")
                         self.is_repositioning = False
@@ -689,13 +607,6 @@ class MyAssignment:
             
             H = np.mean(corners_3d, axis=0)
 
-            # --- AJOUT : LE Z-OFFSET ---
-            # On abaisse le centre mathématique de 15 cm pour anticiper 
-            # l'inclinaison du drone et s'assurer qu'il passe au milieu du vide.
-            z_offset = 0.0
-            H[2] = H[2] - z_offset
-            # ---------------------------
-
             v_width = corners_3d[1] - corners_3d[0]
             dx_normal = -v_width[1]
             dy_normal = v_width[0]
@@ -711,21 +622,24 @@ class MyAssignment:
             self.curr_gate_index += 1
 
             # --- MÉMORISATION DES CIBLES ---
-           # --- MÉMORISATION DES CIBLES ---
             self.gate_yaw_target = gate_yaw
             self.gate_z_target = H[2]
+        
+            side_margin = 0.05  # 5 cm vers la droite
+            offset_x = side_margin * np.sin(gate_yaw)
+            offset_y = -side_margin * np.cos(gate_yaw)
             
-            # Point d'approche à 0.5m
-            app_dist = 0.5
+            # Point d'approche à 0.6m
+            app_dist = 0.6
             self.app_x = H[0] - app_dist * np.cos(gate_yaw)
             self.app_y = H[1] - app_dist * np.sin(gate_yaw)
             
             # Centre de la porte
-            self.mid_x = H[0]
-            self.mid_y = H[1]
+            self.mid_x = H[0] + offset_x
+            self.mid_y = H[1] + offset_y
             
-            # Point de sortie à 0.5m
-            exit_dist = 0.5
+            # Point de sortie à 0.6m
+            exit_dist = 0.6
             self.exit_x = H[0] + exit_dist * np.cos(gate_yaw)
             self.exit_y = H[1] + exit_dist * np.sin(gate_yaw)
 
@@ -738,7 +652,7 @@ class MyAssignment:
 
         if self.state == TRAVEL_GATE:
             
-            # --- PHASE 0 : VOLER VERS L'APPROCHE (0.5m devant) ---
+            # --- PHASE 0 : VOLER VERS L'APPROCHE (0.6m devant) ---
             if self.travel_phase == 0:
                 self.x_target = self.app_x
                 self.y_target = self.app_y
@@ -751,7 +665,7 @@ class MyAssignment:
                     sensor_data['z_global'] - self.gate_z_target
                 ])
                 
-                if dist_to_app < 0.20: # Dès qu'on est très proche, on vise le milieu
+                if dist_to_app < 0.10: # Dès qu'on est très proche, on vise le milieu
                     self.travel_phase = 1
                     
             # --- PHASE 1 : FRANCHISSEMENT (Vers le milieu exact) ---
@@ -767,10 +681,10 @@ class MyAssignment:
                     sensor_data['z_global'] - self.gate_z_target
                 ])
                 
-                if dist_to_mid < 0.20: # On a passé le cadre, on vise la sortie
+                if dist_to_mid < 0.10: # On a passé le cadre, on vise la sortie
                     self.travel_phase = 2
                     
-            # --- PHASE 2 : DÉGAGEMENT (0.5m derrière) ---
+            # --- PHASE 2 : DÉGAGEMENT (0.6m derrière) ---
             elif self.travel_phase == 2:
                 self.x_target = self.exit_x
                 self.y_target = self.exit_y
@@ -784,7 +698,7 @@ class MyAssignment:
                 ])
                 
                 # On s'assure d'avoir bien dégagé la porte !
-                if dist_to_exit < 0.20:
+                if dist_to_exit < 0.10:
                     self.terminal_print("Porte franchie en phase de détection !")
                     
                     self.stop_x = sensor_data['x_global']
@@ -949,7 +863,7 @@ class MyAssignment:
                 sensor_data['z_global'] - self.z_target
                 ]))
 
-                if distance < 0.4:
+                if distance < 0.15:
                     self.racing_waypoint_index += 1
                     if self.racing_waypoint_index < len(self.racing_waypoints):
                         self.terminal_print(f"Reached waypoint {self.racing_waypoint_index}, moving to next waypoint")
@@ -965,7 +879,7 @@ class MyAssignment:
             
             # 1. On définit la vitesse globale en fonction de l'état
             if self.state == RACE:
-                max_carrot_dist = 0.80  # RAPIDE : Le drone peut "tirer" jusqu'à 80cm d'un coup
+                max_carrot_dist = 0.8  # RAPIDE : Le drone peut "tirer" jusqu'à 80cm d'un coup
             else:
                 max_carrot_dist = 0.3  # LENT : Le drone avance doucement (15cm) pendant la détection
             
