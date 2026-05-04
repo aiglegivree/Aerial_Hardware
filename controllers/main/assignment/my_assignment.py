@@ -57,17 +57,17 @@ class MyAssignment:
         self.frames_detected = 0
         self.dynamic_z = 1.15
 
-        # --- Variables de recherche ---
+        # Search variables
         self.yaw_accumulated = 0.0          
         self.is_vertical_search_active = False
         self.vertical_search_target = 2.0
         
-        # --- NOUVEAU : Variables pour l'angle mort (Random Walk) ---
+        # random walk param
         self.is_repositioning = False
         self.reposition_target_x = 0.0
         self.reposition_target_y = 0.0
 
-        # --- Variables d'optique et de mémoire ---
+        # optical variable 
         self.current_estimated_dist = 0.0
         self.look_at_x = 0.0
         self.look_at_y = 0.0
@@ -101,21 +101,21 @@ class MyAssignment:
 
         self.app_x = 0.0
         self.app_y = 0.0
-        self.mid_x = 0.0 # NOUVEAU
-        self.mid_y = 0.0 # NOUVEAU
+        self.mid_x = 0.0 
+        self.mid_y = 0.0 
         self.exit_x = 0.0
         self.exit_y = 0.0
         self.gate_yaw_target = 0.0
         self.gate_z_target = 0.0
         
-        self.travel_phase = 0 # NOUVEAU : 0=Approche, 1=Centre, 2=Sortie
+        self.travel_phase = 0 
         self.curr_gate_index = 0
         self.expected_cadrans = [4, 2, 0, 10, 8]
 
         self.est_gate_pos_2d = np.zeros((5, 2))
         self.est_gate_pos_2d_bis = np.zeros((5, 2))
 
-        self.memorized_gate_width = None # NOUVEAU : Mémoire pour contrer l'occlusion
+        self.memorized_gate_width = None 
 
         self.racing_waypoints = []
         self.racing_waypoint_index = 0
@@ -140,15 +140,14 @@ class MyAssignment:
         if len(approx) == 4:
             corners_2d = approx.reshape(4, 2)
         else:
-            # PLAN B : Si le contour est bruité ou un peu arrondi, 
-            # on l'enferme dans le plus petit rectangle orienté possible
+            # if approxis not good we fallback to this
             rect = cv2.minAreaRect(contour)
             box = cv2.boxPoints(rect)
             corners_2d = np.int32(box)
 
         #top-bottom sorting
         sorted_indices = np.argsort(corners_2d[:, 1])
-        top_corners = corners_2d[sorted_indices[:2]]    # Les 2 points les plus hauts
+        top_corners = corners_2d[sorted_indices[:2]]    
         bottom_corners = corners_2d[sorted_indices[2:]]
 
         #left-right sorting
@@ -331,7 +330,6 @@ class MyAssignment:
             else:
                 self.frames_detected = 0
 
-            # --- TRANSITIONS DETECT 1 ---
             if self.state == TRAVEL_GATE:
                 control_command = [self.exit_x, self.exit_y, self.gate_z_target, self.gate_yaw_target]
                 
@@ -542,7 +540,6 @@ class MyAssignment:
             else:
                 self.frames_detected = 0 
 
-            # --- TRANSITIONS DETECT 2 ---
             if self.state == TRAVEL_GATE:
                 control_command = [self.exit_x, self.exit_y, self.gate_z_target, self.gate_yaw_target]
             elif gate_valid:
@@ -611,39 +608,36 @@ class MyAssignment:
             dx_normal = -v_width[1]
             dy_normal = v_width[0]
             gate_yaw = np.arctan2(dy_normal, dx_normal)
-            
-            # La suite de ton code reste inchangée...
+
             gate_index = self.curr_gate_index
             self.gate_pos[gate_index,:] = [H[0], H[1], H[2], gate_yaw] # Assuming yaw of gate is 0, you can change this if you have a different method to estimate the gate's yaw
 
             self.gate_corner[gate_index, :] = corners_3d
 
-            # ... (Début de COMPUTE_GATE_POS inchangé)
             self.curr_gate_index += 1
 
-            # --- MÉMORISATION DES CIBLES ---
+            # memorisation of the gate position and orientation for the travel phase
             self.gate_yaw_target = gate_yaw
             self.gate_z_target = H[2]
         
-            side_margin = 0.05  # 5 cm vers la droite
+            side_margin = 0.05  # 5 cm shift to the left of the gate
             offset_x = side_margin * np.sin(gate_yaw)
             offset_y = -side_margin * np.cos(gate_yaw)
             
-            # Point d'approche à 0.6m
+            # Approach point at 0.6m in front of the gate
             app_dist = 0.6
             self.app_x = H[0] - app_dist * np.cos(gate_yaw)
             self.app_y = H[1] - app_dist * np.sin(gate_yaw)
             
-            # Centre de la porte
+            # Center point of the gate
             self.mid_x = H[0] + offset_x
             self.mid_y = H[1] + offset_y
             
-            # Point de sortie à 0.6m
+            # Exit point at 0.6m behind the gate
             exit_dist = 0.6
             self.exit_x = H[0] + exit_dist * np.cos(gate_yaw)
             self.exit_y = H[1] + exit_dist * np.sin(gate_yaw)
 
-            # --- ON SUPPRIME LES SPLINES ICI ---
             self.travel_phase = 0
             self.state = TRAVEL_GATE
             self.terminal_print("Passage géométrique strict calculé ! Début du vol...")
@@ -652,7 +646,6 @@ class MyAssignment:
 
         if self.state == TRAVEL_GATE:
             
-            # --- PHASE 0 : VOLER VERS L'APPROCHE (0.6m devant) ---
             if self.travel_phase == 0:
                 self.x_target = self.app_x
                 self.y_target = self.app_y
@@ -665,10 +658,9 @@ class MyAssignment:
                     sensor_data['z_global'] - self.gate_z_target
                 ])
                 
-                if dist_to_app < 0.10: # Dès qu'on est très proche, on vise le milieu
+                if dist_to_app < 0.10:
                     self.travel_phase = 1
                     
-            # --- PHASE 1 : FRANCHISSEMENT (Vers le milieu exact) ---
             elif self.travel_phase == 1:
                 self.x_target = self.mid_x
                 self.y_target = self.mid_y
@@ -681,10 +673,9 @@ class MyAssignment:
                     sensor_data['z_global'] - self.gate_z_target
                 ])
                 
-                if dist_to_mid < 0.10: # On a passé le cadre, on vise la sortie
+                if dist_to_mid < 0.10: 
                     self.travel_phase = 2
                     
-            # --- PHASE 2 : DÉGAGEMENT (0.6m derrière) ---
             elif self.travel_phase == 2:
                 self.x_target = self.exit_x
                 self.y_target = self.exit_y
@@ -697,7 +688,6 @@ class MyAssignment:
                     sensor_data['z_global'] - self.gate_z_target
                 ])
                 
-                # On s'assure d'avoir bien dégagé la porte !
                 if dist_to_exit < 0.10:
                     self.terminal_print("Porte franchie en phase de détection !")
                     
@@ -717,24 +707,18 @@ class MyAssignment:
                 self.terminal_print("CRITICAL ERROR: Not all gate have been detected")
             self.terminal_print("--- Vérification et Tri des portes ---")
             
-            # 1. On utilise le centre connu du circuit
+            #we use the center of the arena as a reference point to compute the angles
             cx, cy = 4.0, 4.0
             
-            # 2. Calcul de l'angle géométrique (atan2) de chaque porte
             angles = np.arctan2(self.gate_pos[:, 1] - cy, self.gate_pos[:, 0] - cx)
             
-            # 3. Le tri magique : argsort classe du plus petit au plus grand angle.
-            # Grâce à l'axe de Webots, cela correspond EXACTEMENT à l'ordre anti-horaire 
-            # en partant de la zone de Take-Off !
             sorted_indices = np.argsort(angles)
             
-            # 4. On réécrit nos mémoires dans le bon ordre
             self.gate_pos = self.gate_pos[sorted_indices]
             self.gate_corner = self.gate_corner[sorted_indices]
             
             self.terminal_print(f"Ordre des portes corrigé : {sorted_indices}")
-            # ----------------------------------------------
-                
+
             nbr_of_lap = 2
             for lap in range(nbr_of_lap):
                 for gate_index in range(5):
@@ -788,21 +772,17 @@ class MyAssignment:
                 est_x = self.est_gate_pos_2d[gate_indices, 0]
                 est_y = self.est_gate_pos_2d[gate_indices, 1]
                 
-                # On applique la même rotation que pour le reste de la carte
                 est_x_rot = 8.0 - est_y
                 est_y_rot = est_x
                 
-                # On dessine les estimations sous forme de croix oranges
                 ax.scatter(est_x_rot, est_y_rot, c="orange", marker="x", s=60, label="Estimated Gates (2D)")
 
                 est_x_bis = self.est_gate_pos_2d_bis[gate_indices, 0]
                 est_y_bis = self.est_gate_pos_2d_bis[gate_indices, 1]
 
-                # On applique la même rotation que pour le reste de la carte
                 est_x_rot_bis = 8.0 - est_y_bis
                 est_y_rot_bis = est_x_bis
                 
-                # On dessine les estimations sous forme de croix oranges
                 ax.scatter(est_x_rot_bis, est_y_rot_bis, c="red", marker="x", s=60, label="Estimated Gates bis (2D)")
 
                 # Orientation arrows
@@ -833,7 +813,6 @@ class MyAssignment:
                 fig.tight_layout()
                 if is_main_thread:
                     plt.show(block=False)
-                    # plt.pause(0.001)
                 else:
                     plot_path = os.path.join(os.path.dirname(__file__), "race_gates_plot.png")
                     fig.savefig(plot_path, dpi=150)
@@ -873,15 +852,11 @@ class MyAssignment:
 
                 control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
                 
-        # --- LISSAGE DE LA POSITION (Carrot-on-a-stick) ---
-        # On ne lisse pas si on est en HOVER (on veut monter direct) ou en COMPUTE (calculs en cours)
-        if self.state not in [HOVER, COMPUTE_GATE_POS, COMPUTE_PATH]:
-            
-            # 1. On définit la vitesse globale en fonction de l'état
+        if self.state not in [HOVER, COMPUTE_GATE_POS, COMPUTE_PATH]:       
             if self.state == RACE:
-                max_carrot_dist = 0.8  # RAPIDE : Le drone peut "tirer" jusqu'à 80cm d'un coup
+                max_carrot_dist = 0.8 
             else:
-                max_carrot_dist = 0.3  # LENT : Le drone avance doucement (15cm) pendant la détection
+                max_carrot_dist = 0.3  
             
             cmd_x, cmd_y, cmd_z, cmd_yaw = control_command
             
@@ -895,7 +870,6 @@ class MyAssignment:
             
             dist = np.linalg.norm([dx, dy, dz])
             
-            # 2. Application du lissage
             if dist > max_carrot_dist:
                 cmd_x = curr_x + (dx / dist) * max_carrot_dist
                 cmd_y = curr_y + (dy / dist) * max_carrot_dist
@@ -903,7 +877,7 @@ class MyAssignment:
                 
             control_command = [cmd_x, cmd_y, cmd_z, cmd_yaw]
 
-        return control_command # Ordered as array with: [pos_x_cmd, pos_y_cmd, pos_z_cmd, yaw_cmd] in meters and radians
+        return control_command 
 
 
 # Module-level singleton so main.py can call assignment.get_command() unchanged
