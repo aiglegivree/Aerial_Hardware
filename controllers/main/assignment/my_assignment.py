@@ -122,8 +122,8 @@ class MyAssignment:
         self.racing_waypoint_index = 0
 
         # Toggle to enable/disable final race plot generation
-        self.show_plot = True
-        self.show_terminal_prints = True
+        self.show_plot = False
+        self.show_terminal_prints = False
 
     def terminal_print(self, message):
         if self.show_terminal_prints:
@@ -720,13 +720,7 @@ class MyAssignment:
             
             self.terminal_print(f"Ordre des portes corrigé : {sorted_indices}")
 
-            gate0_x, gate0_y, gate0_z, gate0_yaw = self.gate_pos[0]
-            start_dist = 2.0  # On recule de 2 mètres dans l'axe de la porte
-            #start_x = gate0_x - start_dist * np.cos(gate0_yaw)
-            #start_y = gate0_y - start_dist * np.sin(gate0_yaw)
-
             gate0_z = self.gate_pos[0, 2]
-            # On calcule l'angle pour que le drone regarde la 1ère porte depuis le point de départ
             yaw_to_gate0 = np.arctan2(self.gate_pos[0, 1] - self.start_y, self.gate_pos[0, 0] - self.start_x)
             
             self.racing_waypoints.append([self.start_x, self.start_y, gate0_z, yaw_to_gate0])
@@ -734,30 +728,27 @@ class MyAssignment:
 
             nbr_of_lap = 2
             
-            # On crée un "tunnel" pour forcer la spline à rester droite
-            dist_far = 0.8     # Point d'alignement lointain
-            dist_close = 0.2 # Point de verrouillage (très près de la porte)
+            #tunnel on the gate
+            dist_far = 0.8     
+            dist_close = 0.2 
             
-            for lap in range(nbr_of_lap):
+            for _ in range(nbr_of_lap):
                 for gate_index in range(5):
                     gate_x = self.gate_pos[gate_index, 0]
                     gate_y = self.gate_pos[gate_index, 1]
                     gate_z = self.gate_pos[gate_index, 2]
                     gate_yaw = self.gate_pos[gate_index, 3]
-
-                    # Points lointains
+      
                     wp_app_far_x = gate_x - dist_far * np.cos(gate_yaw)
                     wp_app_far_y = gate_y - dist_far * np.sin(gate_yaw)
                     wp_exit_far_x = gate_x + dist_far * np.cos(gate_yaw)
                     wp_exit_far_y = gate_y + dist_far * np.sin(gate_yaw)
-                    
-                    # Points proches (verrouillent l'axe)
+                         
                     wp_app_close_x = gate_x - dist_close * np.cos(gate_yaw)
                     wp_app_close_y = gate_y - dist_close * np.sin(gate_yaw)
                     wp_exit_close_x = gate_x + dist_close * np.cos(gate_yaw)
                     wp_exit_close_y = gate_y + dist_close * np.sin(gate_yaw)
 
-                    # On empile tout ça dans l'ordre de passage
                     self.racing_waypoints.append([wp_app_far_x, wp_app_far_y, gate_z, gate_yaw])
                     self.racing_waypoints.append([wp_app_close_x, wp_app_close_y, gate_z, gate_yaw])
                     self.racing_waypoints.append([gate_x, gate_y, gate_z, gate_yaw]) # Centre
@@ -766,38 +757,29 @@ class MyAssignment:
 
             gate4_z = self.gate_pos[4, 2]
             
-            # On atterrit au point de départ, à la hauteur de la dernière porte
+
             self.racing_waypoints.append([self.start_x, self.start_y, gate4_z, self.start_yaw])
-            # 1. Extraction des coordonnées de tous tes waypoints
+
             points = np.array(self.racing_waypoints)
             x = points[:, 0]
             y = points[:, 1]
             z = points[:, 2]
             
-            # np.unwrap empêche le drone de faire des toupies si l'angle passe de pi à -pi
             yaw = np.unwrap(points[:, 3]) 
 
-            # 2. Paramétrage temporel basé sur la distance
-            # On calcule la distance linéaire entre chaque waypoint consécutif
             dists = np.linalg.norm(np.diff(points[:, :3], axis=0), axis=1)
             
-            # On fixe une vitesse de base (1.5 m/s pour commencer en douceur)
-            target_speed = 1.5 
+            target_speed = 2.5
             
-            # On calcule le temps nécessaire pour parcourir chaque segment
             t_intervals = dists / target_speed
             
-            # On crée l'axe du temps t (0 sec, puis cumul des intervalles)
             t = np.concatenate(([0], np.cumsum(t_intervals)))
 
-            # 3. Génération des splines cubiques
-            # bc_type='periodic' permet de raccorder parfaitement la fin avec le début
             self.cs_x = CubicSpline(t, x)
             self.cs_y = CubicSpline(t, y)
             self.cs_z = CubicSpline(t, z)
             self.cs_yaw = CubicSpline(t, yaw)
 
-            # On mémorise le temps total pour faire le circuit et on initialise le chrono
             self.t_max = t[-1]    
             self.race_time = 0.0
 
@@ -852,12 +834,10 @@ class MyAssignment:
                 x_plot = self.cs_x(t_plot)
                 y_plot = self.cs_y(t_plot)
                 
-                # On applique la même rotation que ton affichage de carte
                 x_plot_rot = 8.0 - y_plot
                 y_plot_rot = x_plot
                 
                 ax.plot(x_plot_rot, y_plot_rot, 'b--', linewidth=2, label="Trajectoire Spline")
-                # --------------------------
 
                 # Orientation arrows
                 u = np.cos(gyaw)
@@ -901,43 +881,53 @@ class MyAssignment:
             self.yaw_target = yaw_to_gate0
             self.state = PRE_RACE
             self.terminal_print("Computed racing path, transitioning to PRE_RACE to align on start line")
-            # La commande initiale pour aller au départ :
             control_command = [self.start_x, self.start_y, self.gate_pos[0, 2], yaw_to_gate0]
 
         if self.state == PRE_RACE:
-            # On calcule la distance restante pour atteindre la ligne de départ
             dist_to_start = np.linalg.norm([
                 sensor_data['x_global'] - self.x_target,
                 sensor_data['y_global'] - self.y_target,
                 sensor_data['z_global'] - self.z_target
             ])
 
-            # Si le drone est à moins de 15 cm de son pad de départ, LA COURSE COMMENCE
             if dist_to_start < 0.15:
                 self.state = RACE
-                self.race_time = 0.0  # On remet le chrono de la spline à 0 pile au bon moment !
+                self.race_time = 0.0  
                 self.terminal_print("Aligned at start point. 3... 2... 1... GO!")
             
-            # On envoie la commande stockée
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
-            
+
         if self.state == RACE:
-            self.race_time += dt
+            current_ideal_x = float(self.cs_x(self.race_time))
+            current_ideal_y = float(self.cs_y(self.race_time))
             
-            look_ahead_time = 0.1
+            error_dist = np.linalg.norm([
+                sensor_data['x_global'] - current_ideal_x,
+                sensor_data['y_global'] - current_ideal_y
+            ])
+            
+            if error_dist > 0.2:
+                time_scale = np.clip(1.0 - ((error_dist - 0.2) / 0.4), 0.5, 1.0)
+            else:
+                time_scale = 1.0
+                
+            self.race_time += dt * time_scale
+            
+            look_ahead_time = 0.25
+            
             t_current = self.race_time + look_ahead_time
-            
-            # Si on a fini la course, on s'arrête sur le dernier point
             if t_current >= self.t_max:
                 t_current = self.t_max
-                # Optionnel : Tu peux ajouter ici une logique pour atterrir ou revenir au start
                 self.terminal_print("Ligne d'arrivée franchie ! Fin du chrono.")
             
             self.x_target = float(self.cs_x(t_current))
             self.y_target = float(self.cs_y(t_current))
             self.z_target = float(self.cs_z(t_current))
             
-            raw_yaw = float(self.cs_yaw(t_current))
+            v_x = float(self.cs_x(t_current, nu=1))
+            v_y = float(self.cs_y(t_current, nu=1))
+            
+            raw_yaw = np.arctan2(v_y, v_x)
             self.yaw_target = (raw_yaw + np.pi) % (2 * np.pi) - np.pi
 
             control_command = [self.x_target, self.y_target, self.z_target, self.yaw_target]
