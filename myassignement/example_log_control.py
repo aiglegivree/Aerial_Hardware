@@ -44,7 +44,7 @@ from cflib.crazyflie.log import LogConfig
 from cflib.utils import uri_helper
 
 # TODO: CHANGE THIS URI TO YOUR CRAZYFLIE & YOUR RADIO CHANNEL
-uri = uri_helper.uri_from_env(default='radio://0/100/2M/E7E7E7E720')
+uri = uri_helper.uri_from_env(default='radio://0/20/2M/E7E7E7E708')
 
 # Only output errors from the logging framework
 logging.basicConfig(level=logging.ERROR)
@@ -188,10 +188,10 @@ if __name__ == '__main__':
 
         # Move
         for _ in range(50):
-            cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
+            cf.commander.send_hover_setpoint(0.3, 0, 0, 0.4)
             time.sleep(0.1)
         for _ in range(50):
-            cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
+            cf.commander.send_hover_setpoint(-0.3, 0, 0, 0.4)
             time.sleep(0.1)
 
         # Land
