@@ -45,7 +45,7 @@ class FPVWindow(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Crazyflie FPV')
-        self._frames_dir = Path(__file__).resolve().parent / 'frames'
+        self._frames_dir = Path(__file__).resolve().parent / 'frames_grid'
         self._frames_dir.mkdir(exist_ok=True)
         self._frame_index = 0
 
