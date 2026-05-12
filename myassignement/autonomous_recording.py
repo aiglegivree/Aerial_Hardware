@@ -118,14 +118,11 @@ if __name__ == '__main__':
             cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
             time.sleep(0.1)
 
-        # Move forward
-        for _ in range(50):
-            cf.commander.send_hover_setpoint(0.3, 0, 0, 0.4)
-            time.sleep(0.1)
-
-        # Move backward
-        for _ in range(50):
-            cf.commander.send_hover_setpoint(-0.3, 0, 0, 0.4)
+        # Circle from origin around (-5, 0) with radius 5m
+        for t in range(100):
+            x = -5 + 5 * np.cos(2 * np.pi * t / 100)
+            y = 5 * np.sin(2 * np.pi * t / 100)
+            cf.commander.send_position_setpoint(x, y, 0, 0.4)
             time.sleep(0.1)
 
         # Return to hover
