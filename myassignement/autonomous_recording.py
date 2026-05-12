@@ -78,10 +78,10 @@ if __name__ == '__main__':
     time.sleep(1.0)
 
     # Setup timestamped folder for images
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    '''timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     frames_dir = Path(__file__).resolve().parent / 'frames' / timestamp
     frames_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Recording images to {frames_dir}")
+    print(f"Recording images to {frames_dir}")'''
 
     frame_index = 0
     def _update_image(img):
@@ -91,6 +91,8 @@ if __name__ == '__main__':
         #frame_path = frames_dir / f'frame_{frame_index:06d}.png'
         #cv2.imwrite(str(frame_path), cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
         #frame_index += 1
+
+        # ---- ADD YOUR IMAGE PROCESSING CODE HERE ----
 
     # Start getting camera images
     img_thread = ImageThread(cf.link.cpx, _update_image)
@@ -118,6 +120,9 @@ if __name__ == '__main__':
             cf.commander.send_hover_setpoint(0, 0, 0, 0.4)
             time.sleep(0.1)
 
+        #to center the drone at the origin
+        cf.commander.send_position_setpoint(0, 0, 0, 0.4)
+        time.sleep(2)
         # Circle from origin around (-5, 0) with radius 5m
         for t in range(100):
             x = -5 + 5 * np.cos(2 * np.pi * t / 100)
