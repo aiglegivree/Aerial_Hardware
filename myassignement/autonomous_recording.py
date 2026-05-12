@@ -85,12 +85,12 @@ if __name__ == '__main__':
 
     frame_index = 0
     def _update_image(img):
-        global frame_index
+        #global frame_index
         bayer = img.reshape((CAM_HEIGHT, CAM_WIDTH))
-        color = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2RGB)
-        frame_path = frames_dir / f'frame_{frame_index:06d}.png'
-        cv2.imwrite(str(frame_path), cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
-        frame_index += 1
+        color = cv2.cvtColor(bayer, cv2.COLOR_BayerBG2GRAY)
+        #frame_path = frames_dir / f'frame_{frame_index:06d}.png'
+        #cv2.imwrite(str(frame_path), cv2.cvtColor(color, cv2.COLOR_RGB2BGR))
+        #frame_index += 1
 
     # Start getting camera images
     img_thread = ImageThread(cf.link.cpx, _update_image)
