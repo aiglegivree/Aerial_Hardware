@@ -45,7 +45,7 @@ logging.basicConfig(level=logging.ERROR)
 
 # ── connection ─────────────────────────────────────────────────────────────────
 
-CONTROL_URI = uri_helper.uri_from_env(default='radio://0/10/2M/E7E7E7E701')
+CONTROL_URI = uri_helper.uri_from_env(default='radio://0/10/2M/E7E7E7E708')
 
 UDP_AIDECK_IP   = '192.168.4.1'
 UDP_AIDECK_PORT = 5000
@@ -373,11 +373,7 @@ if __name__ == '__main__':
     cam = UdpVideoThread()
     cam.start()
 
-    # Wait for first frame before arming
-    print('Waiting for first camera frame...')
-    while cam.latest_frame is None:
-        time.sleep(0.05)
-    print('Camera ready')
+    # Camera thread runs asynchronously (no blocking wait, like FPV control)
 
     # Build controller (sets up log variables)
     ctrl = GateController(cf, cam)
