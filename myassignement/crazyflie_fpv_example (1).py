@@ -32,7 +32,7 @@ def _muted_stderr():
         os.close(saved)
 
 # --- Configure these for your setup ---
-URI         = 'radio://0/10/2M/E7E7E7E701'
+URI         = 'radio://0/20/2M/E7E7E7E708'
 AIDECK_IP   = '192.168.4.1'
 AIDECK_PORT = 5000
 LOCAL_PORT  = 5001
