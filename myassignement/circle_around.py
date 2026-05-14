@@ -73,6 +73,15 @@ PAN_ANGLE    = 180.0 # deg
 
 FRAME_SAVE_DIR = os.path.join('myassignement', 'frames')
 
+# state machine
+
+STATE_TAKEOFF = 'takeoff'
+STATE_PAN     = 'pan'
+STATE_FORWARD = 'forward'
+STATE_BACK    = 'back'
+STATE_LAND    = 'land'
+STATE_DONE    = 'done'
+
 
 # ── camera thread ──────────────────────────────────────────────────────────────
 
@@ -269,31 +278,120 @@ class GateController:
         self._cf.param.set_value('kalman.resetEstimation', '0')
         time.sleep(2)
 
+        # try:
+        #     self.takeoff()
+        #     if not self._stop:
+        #         self.pan_around()
+        #     msg = 'Pan complete' if not self._stop else 'Emergency stop'
+        #     print(f'\n{msg} — landing')
+        #     # go to 1 m in from
+        #     self._cf.commander.send_position_setpoint(1.0, 0.0, CRUISE_ALT, 0.0)
+        #     time.sleep(5.0)
+        #     self._cf.commander.send_position_setpoint(0.0, 0.0, CRUISE_ALT, 0.0)
+        #     time.sleep(5.0)
+        #     # land
+        #     self.land()
+
+        # except Exception as e:
+        #     print(f'\nUnhandled exception during mission: {e} — landing now')
+
+        # finally:
+        #     # Always attempt a controlled landing, whatever happened above.
+        #     # _stop_motors() is NOT called here — land() does a gradual descent
+        #     # and only cuts motors at the end, so the drone doesn't just drop.
+        #     try:
+        #         self.land()
+        #     except Exception as e:
+        #         print(f'Land failed ({e}) — cutting motors')
+        #         self._stop_motors()
+
+        state = STATE_TAKEOFF
+
+        # timers / flags
+        state_start = time.time()
+
         try:
-            self.takeoff()
-            if not self._stop:
-                self.pan_around()
-            msg = 'Pan complete' if not self._stop else 'Emergency stop'
-            print(f'\n{msg} — landing')
-            # go to 1 m in from
-            self._cf.commander.send_position_setpoint(1.0, 0.0, CRUISE_ALT, 0.0)
-            time.sleep(5.0)
-            self._cf.commander.send_position_setpoint(0.0, 0.0, CRUISE_ALT, 0.0)
-            time.sleep(5.0)
-            # land
-            self.land()
+
+            while not self._stop and state != STATE_DONE:
+
+                # ─────────────────────────────────────────────
+                # TAKEOFF
+                # ─────────────────────────────────────────────
+                if state == STATE_TAKEOFF:
+
+                    print('[STATE] TAKEOFF')
+
+                    self.takeoff()
+
+                    state = STATE_PAN
+                    state_start = time.time()
+
+                # ─────────────────────────────────────────────
+                # PAN
+                # ─────────────────────────────────────────────
+                elif state == STATE_PAN:
+
+                    print('[STATE] PAN')
+
+                    self.pan_around()
+
+                    state = STATE_FORWARD
+                    state_start = time.time()
+
+                # ─────────────────────────────────────────────
+                # FORWARD
+                # ─────────────────────────────────────────────
+                elif state == STATE_FORWARD:
+
+                    print('[STATE] FORWARD')
+
+                    duration = 3.0
+                    t_end = time.time() + duration
+
+                    while time.time() < t_end and not self._stop:
+                        self._safe_hover(vx=0.2, z=CRUISE_ALT)
+                        time.sleep(0.05)
+
+                    state = STATE_BACK
+                    state_start = time.time()
+
+                # ─────────────────────────────────────────────
+                # BACK
+                # ─────────────────────────────────────────────
+                elif state == STATE_BACK:
+
+                    print('[STATE] BACK')
+
+                    duration = 3.0
+                    t_end = time.time() + duration
+
+                    while time.time() < t_end and not self._stop:
+                        self._safe_hover(vx=-0.2, z=CRUISE_ALT)
+                        time.sleep(0.05)
+
+                    state = STATE_LAND
+                    state_start = time.time()
+
+                # ─────────────────────────────────────────────
+                # LAND
+                # ─────────────────────────────────────────────
+                elif state == STATE_LAND:
+
+                    print('[STATE] LAND')
+
+                    self.land()
+
+                    state = STATE_DONE
+
+            print('Mission complete')
 
         except Exception as e:
-            print(f'\nUnhandled exception during mission: {e} — landing now')
 
-        finally:
-            # Always attempt a controlled landing, whatever happened above.
-            # _stop_motors() is NOT called here — land() does a gradual descent
-            # and only cuts motors at the end, so the drone doesn't just drop.
+            print(f'Unhandled exception: {e}')
+
             try:
                 self.land()
-            except Exception as e:
-                print(f'Land failed ({e}) — cutting motors')
+            except:
                 self._stop_motors()
 
 
