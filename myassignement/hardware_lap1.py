@@ -177,6 +177,8 @@ class UdpVideoThread(threading.Thread):
     def latest_frame_with_ts(self):
         """Return (grayscale_frame_or_None, wall_time_seconds)."""
         with self._lock:
+            print('Latest frame is ', (self._frame is not None), 'with timestamp', self._frame_ts)
+
             return self._frame, self._frame_ts
 
     def run(self):
