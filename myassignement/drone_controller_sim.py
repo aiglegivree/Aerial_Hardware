@@ -91,28 +91,34 @@ IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
 MIN_JPEG_BYTES   = 5000
 
+# ── arena bounds (Lighthouse world frame) ──────────────────────────────────────
+ARENA_X_MIN = -1.0   # m — back wall
+ARENA_X_MAX = +3.0   # m — front wall
+ARENA_Y_MIN = -0.9   # m — right wall
+ARENA_Y_MAX = +0.9   # m — left wall
+
+SAFETY_MARGIN_HARD = 0.15  # m — never fly closer than this to a wall
+
 # ── flight ─────────────────────────────────────────────────────────────────────
 
-CRUISE_ALT       = 0.6   # m
+CRUISE_ALT       = 0.6   # m ## The height position of the drone
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
-KP_VX        = 0.004  # (GATE_SIZE_CLOSE - size) → vx
-KP_VY        = 0.003  # cx_err  → vy
-KP_VZ        = 0.002  # cy_err  → Δz
-MAX_VX       = 0.4    # m/s
-MAX_VY       = 0.3    # m/s
-MAX_VZ_DELTA = 0.3    # m
+# IBVS gains — tune these on the real drone
+KP_VX        = 0.010  # size error  (GATE_SIZE_CLOSE - size) → forward speed
+KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
+KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
+MAX_VX       = 1.0    # m/s — forward cap (never backward)
+MAX_VY       = 0.5    # m/s — strafe cap
+MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
 TRANSIT_VX   = 0.5    # m/s
 TRANSIT_TIME = 2.0    # s
 
-SEARCH_YAW_RATE = 15.0  # deg/s CCW
+SEARCH_YAW_RATE = 5.0  # deg/s CCW
 SEARCH_TIMEOUT  = 10.0  # s — double yaw rate after this
 LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
-
-BOUNDARY_RADIUS      = 2.0  # m — hard limit
-BOUNDARY_SOFT_RADIUS = 1.7  # m — start braking here
 
 N_GATES = 5  # Part 1 vision gates to search for 
 
@@ -131,35 +137,29 @@ WAYPOINT_YAW_KP    = 1.5   # heading error (deg) → yaw rate (deg/s)
 # One patrol waypoint per gate, evenly spaced counter-clockwise around the
 # circle. Replace with explicit (x, y) coordinates once you know your arena.
 NO_GATE_WAYPOINTS = [
-    (PATROL_RADIUS * math.cos(2 * math.pi * i / N_GATES),
-     PATROL_RADIUS * math.sin(2 * math.pi * i / N_GATES))
-    for i in range(N_GATES)
+    (0, -0.2)
 ]
 
 
 # ── Part 2: position-based mission ─────────────────────────────────────────────
 #
 # Fill GATE_POSITIONS once the instructor gives you the exact gate positions.
-# Each entry is the gate CENTRE in the Lighthouse world frame, in metres:
-#     (x, y, z)              — approach direction derived from gate-to-gate line
-#     (x, y, z, yaw_deg)     — yaw_deg = direction the gate faces; the drone
-#                              flies through along this axis (preferred)
-#
-# Gates must be flown counter-clockwise (same order as listed here).
-GATE_POSITIONS = [
-    # (x, y, z)  or  (x, y, z, yaw_deg)
-    # e.g. (1.20, 0.40, 0.80, 90.0),
-]
+# Each gate entry will be (x, y, z, theta, height, width)
+GATE_POSITIONS = []
 
 N_LAPS           = 2     # number of timed laps
-PRE_GATE_OFFSET  = 0.6   # m — waypoint placed before the gate along its approach axis
-POST_GATE_OFFSET = 0.6   # m — waypoint placed after the gate (clears the frame)
-LAP_DURATION_S   = 20.0  # s — total minimum-jerk trajectory time per lap.
-                         #     LOWER = faster; start high (slow) and tune down.
-TRAJ_VEL_LIM     = 20.0  # m/s — planner velocity ceiling (high: real speed set by LAP_DURATION_S)
-TRAJ_ACC_LIM     = 50.0  # m/s² — planner acceleration ceiling
+PRE_GATE_OFFSET  = 0.2   # m — waypoint placed before the gate along its approach axis
+POST_GATE_OFFSET = 0.2   # m — waypoint placed after the gate (clears the frame)
+LAP_DURATION_S   = 30.0  # s — total minimum-jerk trajectory time per lap.
+
+TRAJ_VEL_LIM     = 5.0  # m/s — planner velocity ceiling (high: real speed set by LAP_DURATION_S)
+TRAJ_ACC_LIM     = 5.0  # m/s² — planner acceleration ceiling
 TRAJ_DISC_STEPS  = 20    # trajectory setpoints generated per segment
 POSITION_RATE_HZ = 20.0  # trajectory setpoint streaming rate
+GATE_INWARD_BIAS = 0.0   # m — shift pre/post waypoints toward arena origin
+                         #     to tighten the racing line. Start at 0, try
+                         #     0.1–0.3 once basic laps work. Capped at
+                         #     half the gate width minus a safety margin.
 
 
 # ── camera thread ──────────────────────────────────────────────────────────────
@@ -527,12 +527,11 @@ class GateController:
 
     def _safe_hover(self, vx=0.0, vy=0.0, yaw_rate=0.0, z=CRUISE_ALT):
         """
-        Send hover setpoint, clamping outward velocity near the 2 m boundary.
+        Send hover setpoint, blocking outward velocity at the arena boundary.
 
-        Inside BOUNDARY_SOFT_RADIUS  → no clamping.
-        Between soft and hard radius → outward component linearly reduced to 0.
-        At BOUNDARY_RADIUS           → outward component fully blocked;
-                                        tangential + inward motion preserved.
+        For each axis independently: if the drone is past the safety line and
+        trying to move further into the wall, zero that velocity component.
+        Tangential and inward motion are unaffected.
         """
         x   = self._state['x']
         y   = self._state['y']
@@ -542,20 +541,15 @@ class GateController:
         wx = vx * math.cos(yaw) - vy * math.sin(yaw)
         wy = vx * math.sin(yaw) + vy * math.cos(yaw)
 
-        r = math.sqrt(x**2 + y**2)
-        if r > BOUNDARY_SOFT_RADIUS:
-            ox = x / r if r > 1e-6 else 0.0
-            oy = y / r if r > 1e-6 else 0.0
-            outward = wx * ox + wy * oy
-            if outward > 0:
-                scale  = clamp(
-                    1.0 - (r - BOUNDARY_SOFT_RADIUS) /
-                          (BOUNDARY_RADIUS - BOUNDARY_SOFT_RADIUS),
-                    0.0, 1.0
-                )
-                factor = 1.0 - scale
-                wx    -= factor * outward * ox
-                wy    -= factor * outward * oy
+        # Hard cutoff per axis
+        if x <= ARENA_X_MIN + SAFETY_MARGIN_HARD and wx < 0:
+            wx = 0.0
+        if x >= ARENA_X_MAX - SAFETY_MARGIN_HARD and wx > 0:
+            wx = 0.0
+        if y <= ARENA_Y_MIN + SAFETY_MARGIN_HARD and wy < 0:
+            wy = 0.0
+        if y >= ARENA_Y_MAX - SAFETY_MARGIN_HARD and wy > 0:
+            wy = 0.0
 
         # World → body
         vx_s =  wx * math.cos(yaw) + wy * math.sin(yaw)
@@ -608,7 +602,7 @@ class GateController:
             elapsed = time.time() - t_start
 
             # Oscillate yaw rate like a pendulum to sweep the camera
-            sweep_yaw_rate = math.sin(elapsed * math.pi) * SEARCH_YAW_RATE
+            sweep_yaw_rate = math.sin(elapsed * math.pi / 3.0) * SEARCH_YAW_RATE
             self._safe_hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
 
             time.sleep(0.05)
@@ -617,15 +611,24 @@ class GateController:
 
     def approach_gate(self):
         """
-        Visual servo toward the fitted rectangle centre.
-        Returns True  when size > GATE_SIZE_CLOSE  (→ TRANSIT).
-        Returns False when gate lost               (→ SEARCH).
+        Image-Based Visual Servoing (IBVS).
+
+        Three pixel errors drive three independent velocity commands:
+          e_x = cx - cx_mid          → vy  (strafe left/right)
+          e_y = cy_mid - cy          → Δz  (climb/descend)
+          e_z = GATE_SIZE_CLOSE - sz → vx  (fly forward, never backward)
+
+        Each error is multiplied by its Kp gain and clamped to a safe speed.
+        The drone flies forward until the gate fills the frame (size ≥ GATE_SIZE_CLOSE).
+
+        Returns True  when size ≥ GATE_SIZE_CLOSE  (→ TRANSIT).
+        Returns False when gate lost > LOST_TOLERANCE (→ SEARCH).
         """
-        print('  [APPROACH] flying toward gate')
-        cx_mid   = CAM_WIDTH  / 2.0
-        cy_mid   = CAM_HEIGHT / 2.0
-        lost     = 0
+        print('  [APPROACH] IBVS toward gate')
+        cx_mid   = CAM_WIDTH  / 2.0   # 162 px
+        cy_mid   = CAM_HEIGHT / 2.0   # 122 px
         target_z = CRUISE_ALT
+        lost     = 0
 
         while not self._stop:
             cx, cy, size = get_gate_detection(self._cam.latest_frame)
@@ -635,30 +638,42 @@ class GateController:
                 if lost > LOST_TOLERANCE:
                     print('  [APPROACH] gate lost — back to SEARCH')
                     return False
-                self._safe_hover(vx=0.1, z=target_z)
+                # Hold last commanded altitude while waiting for gate to reappear
+                self._safe_hover(z=target_z)
                 time.sleep(0.05)
                 continue
 
             lost = 0
 
-            if size > GATE_SIZE_CLOSE:
-                print(f'  [APPROACH] close enough (size={size:.0f}px) → TRANSIT')
+            # ── Step 1: check termination ───────────────────────────────────
+            if size >= GATE_SIZE_CLOSE:
+                print(f'  [APPROACH] gate fills frame (size={size:.0f}px) → TRANSIT')
                 return True
 
-            lat_err  = cx - cx_mid
-            vy       = clamp(-KP_VY * lat_err, -MAX_VY, MAX_VY)
+            # ── Step 2: pixel errors ────────────────────────────────────────
+            e_x = cx - cx_mid          # +ve → gate right of centre
+            e_y = cy_mid - cy          # +ve → gate above centre
+            e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small → move forward
 
-            vert_err = cy_mid - cy                          # +ve → gate above → climb
-            target_z = clamp(
-                CRUISE_ALT + KP_VZ * vert_err,
-                CRUISE_ALT - MAX_VZ_DELTA,
-                CRUISE_ALT + MAX_VZ_DELTA,
-            )
+            # ── Step 3: proportional control ────────────────────────────────
+            v_strafe  = KP_VY * e_x
+            v_climb   = KP_VZ * e_y
+            v_forward = KP_VX * e_z
 
-            vx       = clamp(KP_VX * (GATE_SIZE_CLOSE - size), 0.05, MAX_VX)
-            yaw_corr = -0.05 * lat_err                      # deg/s
+            # ── Step 4: clamp to safe speed limits ──────────────────────────
+            v_strafe  = clamp(v_strafe,  -MAX_VY,  MAX_VY)
+            v_climb   = clamp(v_climb,   -MAX_VZ_DELTA, MAX_VZ_DELTA)
+            v_forward = clamp(v_forward,  0.0,     MAX_VX)   # never fly backward
 
-            self._safe_hover(vx=vx, vy=vy, yaw_rate=yaw_corr, z=target_z)
+            target_z  = clamp(CRUISE_ALT + v_climb,
+                              CRUISE_ALT - MAX_VZ_DELTA,
+                              CRUISE_ALT + MAX_VZ_DELTA)
+
+            print(f'  [IBVS] ex={e_x:+.0f}px ey={e_y:+.0f}px size={size:.0f}px'
+                  f'  → vx={v_forward:.2f} vy={v_strafe:+.2f} z={target_z:.2f}')
+
+            # ── Step 5: send command ─────────────────────────────────────────
+            self._safe_hover(vx=v_forward, vy=v_strafe, z=target_z)
             time.sleep(0.05)
 
         return False
@@ -732,76 +747,58 @@ class GateController:
         try:
             self.takeoff(target_z=1.0)
 
-            # ── TEST: hover, detect gate, nudge toward it ─────────────────────
-            print('\n[TEST] Hovering at 1.0 m — calling get_gate_detection every tick')
-            os.makedirs('gate_frames', exist_ok=True)
-            frame_idx = 0
-            target_z  = 1.0
-            cx_mid    = CAM_WIDTH  / 2.0
-            cy_mid    = CAM_HEIGHT / 2.0
+            # ── SIMPLE MISSION: search → approach → transit × N_GATES ──────────
+            for gate_idx in range(N_GATES):
+                if self._stop:
+                    break
+                
+                print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
 
-            while not self._stop:
-                frame = self._cam.latest_frame
-                cx, cy, size = get_gate_detection(frame)
+                # 1. Sweep yaw until the gate appears in frame
+                self.search_for_gate()
+                if self._stop:
+                    break
 
-                if cx is not None:
-                    # Lateral error (px): positive → gate is right of centre → strafe right
-                    lat_err  = cx - cx_mid
-                    vy       = clamp(KP_VY * lat_err, -MAX_VY, MAX_VY)
+                # 2. Servo toward gate; if lost mid-approach, search again
+                while not self._stop:
+                    if self.approach_gate():
+                        self.transit_gate()
+                        break
+                    print('  gate lost — searching again')
+                    self.search_for_gate()
 
-                    # Vertical error (px): positive → gate is above centre → climb
-                    vert_err = cy_mid - cy
-                    target_z = clamp(1.0 + KP_VZ * vert_err,
-                                     1.0 - MAX_VZ_DELTA, 1.0 + MAX_VZ_DELTA)
-
-                    print(f'  [GATE DETECTED] cx={cx:.0f} cy={cy:.0f} size={size:.0f}px'
-                          f'  → vy={vy:+.3f} m/s  z={target_z:.2f} m')
-
-                    if frame is not None:
-                        path = os.path.join('gate_frames', f'gate_{frame_idx:04d}.png')
-                        cv2.imwrite(path, frame)
-                        print(f'  [SAVED] {path}')
-                        frame_idx += 1
-
-                    self._safe_hover(vy=vy, z=target_z)
-                else:
-                    print('  [NO GATE] — holding position')
-                    self._safe_hover(z=target_z)
-
-                time.sleep(0.1)
+            msg = 'All gates complete' if not self._stop else 'Emergency stop'
+            print(f'\n{msg} — landing')
             # ──────────────────────────────────────────────────────────────────
 
-            # ── ORIGINAL MISSION CODE (commented out for testing) ─────────────
-            # for gate_idx in range(N_GATES):
-            #     if self._stop:
-            #         break
-            #     print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
-            #
-            #     # Primary search: fly the patrol leg while watching the camera.
-            #     wx, wy = NO_GATE_WAYPOINTS[gate_idx]
-            #     result = self.fly_to_waypoint(wx, wy, CRUISE_ALT, scan=True)
-            #     if result == 'stopped':
-            #         break
-            #
-            #     # Fallback: sweep-search only if the leg ended with no gate seen.
-            #     if result == 'reached':
-            #         print('  [PATROL] waypoint reached, no gate in view '
-            #               '— falling back to yaw search')
-            #         self.search_for_gate()
-            #         if self._stop:
-            #             break
-            #
-            #     # A gate should now be in view. Approach + transit; if the gate
-            #     # is lost mid-approach, fall back to the yaw search and retry.
-            #     while not self._stop:
-            #         if self.approach_gate():
-            #             self.transit_gate()
-            #             break
-            #         print('  gate lost — falling back to yaw search')
-            #         self.search_for_gate()
-            #
-            # msg = 'All gates complete' if not self._stop else 'Emergency stop'
-            # print(f'\n{msg} — landing')
+            # ── TEST CODE (commented out) ──────────────────────────────────────
+            # print('\n[TEST] Hovering at 1.0 m — calling get_gate_detection every tick')
+            # os.makedirs('gate_frames', exist_ok=True)
+            # frame_idx = 0
+            # target_z  = 1.0
+            # cx_mid    = CAM_WIDTH  / 2.0
+            # cy_mid    = CAM_HEIGHT / 2.0
+            # while not self._stop:
+            #     frame = self._cam.latest_frame
+            #     cx, cy, size = get_gate_detection(frame)
+            #     if cx is not None:
+            #         lat_err  = cx - cx_mid
+            #         vy       = clamp(KP_VY * lat_err, -MAX_VY, MAX_VY)
+            #         vert_err = cy_mid - cy
+            #         target_z = clamp(1.0 + KP_VZ * vert_err,
+            #                          1.0 - MAX_VZ_DELTA, 1.0 + MAX_VZ_DELTA)
+            #         print(f'  [GATE DETECTED] cx={cx:.0f} cy={cy:.0f} size={size:.0f}px'
+            #               f'  → vy={vy:+.3f} m/s  z={target_z:.2f} m')
+            #         if frame is not None:
+            #             path = os.path.join('gate_frames', f'gate_{frame_idx:04d}.png')
+            #             cv2.imwrite(path, frame)
+            #             print(f'  [SAVED] {path}')
+            #             frame_idx += 1
+            #         self._safe_hover(vy=vy, z=target_z)
+            #     else:
+            #         print('  [NO GATE] — holding position')
+            #         self._safe_hover(z=target_z)
+            #     time.sleep(0.1)
             # ──────────────────────────────────────────────────────────────────
 
         except Exception as e:
@@ -822,52 +819,81 @@ class GateController:
     # =========================================================================
 
     def _clamp_to_boundary(self, x, y):
-        """Clamp a target (x, y) so its radius never exceeds the 2 m boundary."""
-        r = math.hypot(x, y)
-        if r > BOUNDARY_RADIUS:
-            s = BOUNDARY_RADIUS / r
-            print(f'  [BOUND] target r={r:.2f} m clamped onto {BOUNDARY_RADIUS} m circle')
-            return x * s, y * s
-        return x, y
+        """Clamp a target (x, y) to the rectangular arena minus the hard safety margin."""
+        x_lo = ARENA_X_MIN + SAFETY_MARGIN_HARD
+        x_hi = ARENA_X_MAX - SAFETY_MARGIN_HARD
+        y_lo = ARENA_Y_MIN + SAFETY_MARGIN_HARD
+        y_hi = ARENA_Y_MAX - SAFETY_MARGIN_HARD
+        xc = clamp(x, x_lo, x_hi)
+        yc = clamp(y, y_lo, y_hi)
+        if (xc, yc) != (x, y):
+            print(f'  [BOUND] target ({x:.2f}, {y:.2f}) clamped to ({xc:.2f}, {yc:.2f})')
+        return xc, yc
 
     def _plan_lap(self, gates, start_xyz):
         """
         Build the one-lap waypoint list and fit a single minimum-jerk
-        trajectory through it — the hardware equivalent of the simulation's
-        handle_fast_lap(): start → (pre-gate, gate centre, post-gate) ×N →
-        return point. Pre/centre/post are colinear along the gate's approach
-        axis so the smooth trajectory passes cleanly through each gate.
+        trajectory through it.
+
+        Each gate is (x, y, z, theta, height, width):
+        x, y, z  — gate centre in the Lighthouse world frame (metres)
+        theta    — orientation of the gate's PLANE in the arena frame (radians).
+                    theta=0 means the plane lies along world X, so the drone
+                    flies through along world Y.
+        height   — gate opening height (unused; z is already the centre)
+        width    — gate opening width; used to cap the inward bias so we
+                    never aim through the gate frame itself.
         """
         waypoints = [tuple(start_xyz)]
-        for i, g in enumerate(gates):
-            gx, gy, gz = g[0], g[1], g[2]
+        prev_xy = (start_xyz[0], start_xyz[1])
 
-            if len(g) >= 4 and g[3] is not None:
-                # Explicit gate facing yaw — fly through along that axis.
-                yaw = math.radians(g[3])
-                dirx, diry = math.cos(yaw), math.sin(yaw)
+        for g in gates:
+            gx, gy, gz, theta, _gh, gw = g
+
+            # Gate's plane direction, then flythrough direction (perpendicular).
+            # Two candidate flythrough axes: ±(-sin θ, cos θ). Pick whichever
+            # points AWAY from the previous waypoint so the drone keeps moving
+            # forward through the course instead of doubling back.
+            nx, ny = -math.sin(theta), math.cos(theta)
+            if (gx - prev_xy[0]) * nx + (gy - prev_xy[1]) * ny < 0:
+                nx, ny = -nx, -ny
+            dirx, diry = nx, ny
+
+            # Inward bias: shift pre/post waypoints toward the arena origin.
+            # The bias direction is along the gate's PLANE (perpendicular to
+            # flythrough), pointing toward origin. Cap by gate half-width so we
+            # never aim outside the gate opening.
+            r = math.hypot(gx, gy)
+            if r > 1e-6 and GATE_INWARD_BIAS > 0:
+                # Unit vector from gate toward origin
+                ix_full, iy_full = -gx / r, -gy / r
+                # Project onto the gate-plane axis (perpendicular to flythrough)
+                plane_x, plane_y = -diry, dirx
+                proj = ix_full * plane_x + iy_full * plane_y
+                bias = clamp(GATE_INWARD_BIAS, 0.0, 0.45 * gw) * proj
+                bx, by = bias * plane_x, bias * plane_y
             else:
-                # Derive approach direction from the previous waypoint.
-                prev = (start_xyz[0], start_xyz[1]) if i == 0 \
-                    else (gates[i - 1][0], gates[i - 1][1])
-                dx, dy = gx - prev[0], gy - prev[1]
-                n = math.hypot(dx, dy)
-                dirx, diry = (dx / n, dy / n) if n > 1e-6 else (1.0, 0.0)
+                bx, by = 0.0, 0.0
 
-            px, py = self._clamp_to_boundary(gx - PRE_GATE_OFFSET * dirx,
-                                             gy - PRE_GATE_OFFSET * diry)
+            # Three colinear waypoints along the flythrough axis: before, centre, after.
+            # Pre and post are nudged inward by (bx, by); the centre is not.
+            px, py = self._clamp_to_boundary(gx - PRE_GATE_OFFSET * dirx + bx,
+                                            gy - PRE_GATE_OFFSET * diry + by)
             cx, cy = self._clamp_to_boundary(gx, gy)
-            qx, qy = self._clamp_to_boundary(gx + POST_GATE_OFFSET * dirx,
-                                             gy + POST_GATE_OFFSET * diry)
+            qx, qy = self._clamp_to_boundary(gx + POST_GATE_OFFSET * dirx + bx,
+                                            gy + POST_GATE_OFFSET * diry + by)
             waypoints.append((px, py, gz))
             waypoints.append((cx, cy, gz))
             waypoints.append((qx, qy, gz))
 
+            prev_xy = (qx, qy)   # next gate's flythrough sign is chosen relative
+                                # to where we just exited, not where we started.
+
         waypoints.append((start_xyz[0], start_xyz[1], CRUISE_ALT))
 
         return WaypointPlanner3D(waypoints, t_f=LAP_DURATION_S,
-                                 disc_steps=TRAJ_DISC_STEPS,
-                                 vel_lim=TRAJ_VEL_LIM, acc_lim=TRAJ_ACC_LIM)
+                                disc_steps=TRAJ_DISC_STEPS,
+                                vel_lim=TRAJ_VEL_LIM, acc_lim=TRAJ_ACC_LIM)
 
     def run_fast_lap(self, gates, n_laps=N_LAPS):
         """
