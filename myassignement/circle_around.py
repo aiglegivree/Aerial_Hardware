@@ -47,19 +47,18 @@ logging.basicConfig(level=logging.ERROR)
 
 CONTROL_URI = uri_helper.uri_from_env(default='radio://0/20/2M/E7E7E7E708')
 
-UDP_AIDECK_IP   = '192.168.4.1' 
-UDP_AIDECK_PORT = 5000
-UDP_LOCAL_PORT  = 5001
-UDP_START_MAGIC = b'FER'
+AIDECK_IP   = '192.168.4.1'
+AIDECK_PORT = 5000
+LOCAL_PORT  = 5001
+START_MAGIC = b'FER'
 
 # ── camera ─────────────────────────────────────────────────────────────────────
-
-CAM_WIDTH  = 324
-CAM_HEIGHT = 244
 
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
+IMG_WIDTH        = 324
+IMG_HEIGHT       = 244
 MIN_JPEG_BYTES   = 5000
 
 # ── flight ─────────────────────────────────────────────────────────────────────
@@ -122,22 +121,17 @@ class UdpVideoThread(threading.Thread):
             return self._frame
 
     def run(self):
-        os.makedirs(FRAME_SAVE_DIR, exist_ok=True)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
-        sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
+        sock.bind(('0.0.0.0', LOCAL_PORT))
+        sock.sendto(START_MAGIC, (AIDECK_IP, AIDECK_PORT))
 
         buffer = bytearray()
         expected_size = 0
         receiving = False
 
         while self._running:
-            try:
-                data, _ = sock.recvfrom(2048)
-            except Exception:
-                time.sleep(0.01)
-                continue
+            data, _ = sock.recvfrom(2048)
             if len(data) < CPX_HEADER_SIZE:
                 continue
             payload = data[CPX_HEADER_SIZE:]
@@ -145,7 +139,7 @@ class UdpVideoThread(threading.Thread):
             if len(payload) >= IMG_HEADER_SIZE and payload[0] == IMG_HEADER_MAGIC:
                 _, w, h, _, _, size = struct.unpack(
                     '<BHHBBI', payload[:IMG_HEADER_SIZE])
-                if w == CAM_WIDTH and h == CAM_HEIGHT and 0 < size < 65536:
+                if w == IMG_WIDTH and h == IMG_HEIGHT and 0 < size < 65536:
                     expected_size = size
                     buffer = bytearray()
                     receiving = True
@@ -161,9 +155,6 @@ class UdpVideoThread(threading.Thread):
                 if frame is not None:
                     with self._lock:
                         self._frame = frame
-                    timestamp = int(time.time() * 1000)
-                    frame_path = os.path.join(FRAME_SAVE_DIR, f'{timestamp}.jpg')
-                    cv2.imwrite(frame_path, frame)
                 receiving = False
 
     def _decode_frame(self, buffer):
@@ -177,15 +168,11 @@ class UdpVideoThread(threading.Thread):
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None : #or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
+        if img is None or img.shape[:2] != (IMG_HEIGHT, IMG_WIDTH):
             return None
-        if img.ndim == 2:
-            return img
-        if img.ndim == 3 and img.shape[2] == 3:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if img.ndim == 3 and img.shape[2] == 4:
-            return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-        return None
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
