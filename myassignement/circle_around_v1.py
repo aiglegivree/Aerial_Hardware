@@ -72,11 +72,11 @@ MIN_JPEG_BYTES   = 5000
 CRUISE_ALT       = 1.5    # m — hover altitude for this test
 TAKEOFF_DURATION = 3.0    # s — linear ramp from start_z to CRUISE_ALT
 LAND_DURATION    = 3.0    # s
-SETPOINT_PERIOD  = 0.05   # s (20 Hz)
+SETPOINT_PERIOD  = 0.1   # s (20 Hz)
 
-CIRCLE_RADIUS   = 1.0     # m
-CIRCLE_OFFSET   = 1.0     # m — centre is this far in front of start, along start yaw
-WAYPOINT_SPACING = 0.40   # m — arc distance between circle waypoints
+CIRCLE_RADIUS   = .30     # m
+CIRCLE_OFFSET   = .70     # m — centre is this far in front of start, along start yaw
+WAYPOINT_SPACING = 0.20   # m — arc distance between circle waypoints
 CIRCLE_OMEGA     = 0.30   # rad/s — ~21-s lap at r=1 m
 
 ARRIVAL_TOL_XY  = 0.12   # m
@@ -191,7 +191,8 @@ class UdpVideoThread(threading.Thread):
                         cv2.putText(frame_bgr, 'no gate', (10, 20),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
                     fname = f'frame_{frame_count:06d}.jpg'
-                    cv2.imwrite(os.path.join(save_dir, fname), frame_bgr)
+                    cv2.imwrite(os.path.join(save_dir, fname), frame)
+                    cv2.imwrite(os.path.join(save_dir, f'frame_{frame_count:06d}_det.jpg'), frame_bgr)
                     frame_count += 1
                 receiving = False
 
@@ -350,8 +351,9 @@ class GateController:
             y = cy + radius * math.sin(theta)
             yaw_target_rad = theta + math.pi / 2.0  # CCW tangent
             self._send_pos(x, y, z, math.degrees(yaw_target_rad))
-            time.sleep(SETPOINT_PERIOD)
-
+            # time.sleep(SETPOINT_PERIOD)
+            self._wait_until_at(x, y, z, math.degrees(yaw_target_rad), check_yaw=True,
+                                tol_xy=0.10, tol_z=0.15, tol_yaw=10.0, timeout=1.0)
         # Rotate back to the start heading and hold briefly before landing.
         for _ in range(40):  # ~2 s
             if self._stop:
