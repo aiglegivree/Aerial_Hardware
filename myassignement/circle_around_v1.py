@@ -20,11 +20,14 @@ Press 'q' for emergency stop (a second 'q' cuts motors immediately).
 """
 
 import contextlib
+import datetime
 import logging
 import math
 import os
+import pathlib
 import socket
 import struct
+import sys
 import time
 import threading
 import warnings
@@ -32,6 +35,9 @@ import warnings
 import cv2
 import numpy as np
 from pynput import keyboard
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from gate_detection import find_gate_rectangles, get_gate_mask, GATE_SIZE_MIN
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
@@ -70,9 +76,15 @@ SETPOINT_PERIOD  = 0.05   # s (20 Hz)
 
 CIRCLE_RADIUS   = 1.0     # m
 CIRCLE_OFFSET   = 1.0     # m — centre is this far in front of start, along start yaw
-CIRCLE_OMEGA    = 0.35    # rad/s — angular speed along the circle (CCW)
+WAYPOINT_SPACING = 0.40   # m — arc distance between circle waypoints
+CIRCLE_OMEGA     = 0.30   # rad/s — ~21-s lap at r=1 m
 
-FRAME_SAVE_DIR = os.path.join('myassignement', 'frames')
+ARRIVAL_TOL_XY  = 0.12   # m
+ARRIVAL_TOL_Z   = 0.10   # m
+ARRIVAL_TOL_YAW = 5.0    # deg
+ARRIVAL_TIMEOUT = 15.0   # s
+
+FRAME_SAVE_BASE = os.path.join('myassignement', 'frames')
 
 # state machine
 
@@ -119,7 +131,10 @@ class UdpVideoThread(threading.Thread):
             return self._frame
 
     def run(self):
-        os.makedirs(FRAME_SAVE_DIR, exist_ok=True)
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        save_dir = os.path.join(FRAME_SAVE_BASE, ts)
+        os.makedirs(save_dir, exist_ok=True)
+        frame_count = 0
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
@@ -158,9 +173,26 @@ class UdpVideoThread(threading.Thread):
                 if frame is not None:
                     with self._lock:
                         self._frame = frame
-                    timestamp = int(time.time() * 1000)
-                    frame_path = os.path.join(FRAME_SAVE_DIR, f'{timestamp}.jpg')
-                    cv2.imwrite(frame_path, frame)
+                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                    mask  = get_gate_mask(frame_bgr)
+                    rects = find_gate_rectangles(mask)
+                    for r in rects:
+                        cv2.drawContours(frame_bgr, [r['box']], 0, (0, 255, 0), 2)
+                    if rects:
+                        best = max(rects, key=lambda r: max(r['size']))
+                        cx, cy = best['center']
+                        size   = max(best['size'])
+                        if size >= GATE_SIZE_MIN:
+                            cv2.circle(frame_bgr, (int(cx), int(cy)), 8, (0, 0, 255), -1)
+                            cv2.putText(frame_bgr, f'sz={size:.0f}',
+                                        (int(cx) + 10, int(cy) - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                    else:
+                        cv2.putText(frame_bgr, 'no gate', (10, 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 200), 1)
+                    fname = f'frame_{frame_count:06d}.jpg'
+                    cv2.imwrite(os.path.join(save_dir, fname), frame_bgr)
+                    frame_count += 1
                 receiving = False
 
     def _decode_frame(self, buffer):
@@ -232,6 +264,25 @@ class GateController:
     def _stop_motors(self):
         self._cf.commander.send_stop_setpoint()
 
+    def _wait_until_at(self, x, y, z, yaw_deg, check_yaw=False,
+                       tol_xy=ARRIVAL_TOL_XY, tol_z=ARRIVAL_TOL_Z,
+                       tol_yaw=ARRIVAL_TOL_YAW, timeout=ARRIVAL_TIMEOUT):
+        """Hold a position setpoint until the drone arrives or timeout expires."""
+        t_end = time.time() + timeout
+        while not self._stop and time.time() < t_end:
+            self._send_pos(x, y, z, yaw_deg)
+            s = self._state
+            err_xy  = math.hypot(s['x'] - x, s['y'] - y)
+            err_z   = abs(s['z'] - z)
+            arrived = err_xy < tol_xy and err_z < tol_z
+            if check_yaw:
+                err_yaw = abs(((s['yaw'] - yaw_deg + 180) % 360) - 180)
+                arrived = arrived and err_yaw < tol_yaw
+            if arrived:
+                return True
+            time.sleep(SETPOINT_PERIOD)
+        return False  # timed out
+
     # ── take-off / landing using position setpoints ──────────────────────────
 
     def takeoff(self, start_x, start_y, start_yaw_deg, target_z=CRUISE_ALT):
@@ -245,11 +296,7 @@ class GateController:
             self._send_pos(start_x, start_y, z, start_yaw_deg)
             time.sleep(SETPOINT_PERIOD)
         # settle at target
-        for _ in range(20):
-            if self._stop:
-                return
-            self._send_pos(start_x, start_y, target_z, start_yaw_deg)
-            time.sleep(SETPOINT_PERIOD)
+        self._wait_until_at(start_x, start_y, target_z, start_yaw_deg, check_yaw=False)
 
     def land(self):
         print('Landing')
