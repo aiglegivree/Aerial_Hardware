@@ -185,7 +185,6 @@ class UdpVideoThread(threading.Thread):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
-        sock.settimeout(1.0)
         sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
 
         buffer        = bytearray()
@@ -193,11 +192,7 @@ class UdpVideoThread(threading.Thread):
         receiving     = False
 
         while self._running:
-            try:
-                data, _ = sock.recvfrom(2048)
-            except Exception:
-                time.sleep(0.01)
-                continue
+            data, _ = sock.recvfrom(2048)
 
             if len(data) < CPX_HEADER_SIZE:
                 continue
@@ -234,15 +229,11 @@ class UdpVideoThread(threading.Thread):
         jpeg = np.frombuffer(buf, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None:# or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
+        if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
             return None
-        if img.ndim == 2:
-            return img
-        if img.ndim == 3 and img.shape[2] == 3:
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if img.ndim == 3 and img.shape[2] == 4:
-            return cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-        return None
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
 
 
 # ── main controller ─────────────────────────────────────────────────────────────
