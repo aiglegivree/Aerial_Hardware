@@ -283,21 +283,19 @@ class GateController:
                 return True
             time.sleep(SETPOINT_PERIOD)
         return False  # timed out
+    def _safe_hover(self, vx=0.0, vy=0.0, yaw_rate=0.0, z=CRUISE_ALT):
+        self._cf.commander.send_hover_setpoint(vx, vy, yaw_rate, z)
 
     # ── take-off / landing using position setpoints ──────────────────────────
-
-    def takeoff(self, start_x, start_y, start_yaw_deg, target_z=CRUISE_ALT):
-        print(f'Taking off to {target_z:.2f} m at ({start_x:.2f}, {start_y:.2f})')
-        start_z = self._state['z']
-        steps = max(1, int(TAKEOFF_DURATION / SETPOINT_PERIOD))
-        for i in range(1, steps + 1):
-            if self._stop:
-                return
-            z = start_z + (target_z - start_z) * (i / steps)
-            self._send_pos(start_x, start_y, z, start_yaw_deg)
-            time.sleep(SETPOINT_PERIOD)
-        # settle at target
-        self._wait_until_at(start_x, start_y, target_z, start_yaw_deg, check_yaw=False)
+    def takeoff(self, start_x, start_y, start_yaw_deg,target_z=CRUISE_ALT):
+        print(f'Taking off to {target_z:.2f} m')
+        steps = int(TAKEOFF_DURATION / 0.1)
+        for i in range(steps):
+            self._safe_hover(z=target_z * (i / steps))
+            time.sleep(0.1)
+        for _ in range(20):
+            self._safe_hover(z=target_z)
+            time.sleep(0.1)
 
     def land(self):
         print('Landing')
