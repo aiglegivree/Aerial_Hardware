@@ -241,6 +241,77 @@ class UdpVideoThread(threading.Thread):
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+def get_gate_detection(frame):
+    """
+    Uses grayscale adaptive thresholding instead of HSV color filtering.
+    Returns: cx, cy, size (or None, None, None if nothing found)
+    """
+    if frame is None:
+        return None, None, None
+
+    # Ensure image is grayscale
+    if len(frame.shape) == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame
+
+    # Adaptive thresholding: finds dark objects on light backgrounds (or vice versa)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # Morphological operations to clean up noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best_score = 0.0
+    best_gate = None
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 250:
+            continue
+
+        rect = cv2.minAreaRect(cnt)
+        (rcx, rcy), (rw, rh), angle = rect
+        if rw < 10 or rh < 10:
+            continue
+
+        # Aspect ratio check
+        short_side, long_side = sorted([rw, rh])
+        aspect = short_side / long_side
+        if aspect < 0.45:
+            continue
+
+        # Rectangularity check
+        rotated_area = rw * rh
+        rectangularity = area / rotated_area
+        if rectangularity < 0.80:
+            continue
+
+        # Solidity check
+        hull_area = cv2.contourArea(cv2.convexHull(cnt))
+        if hull_area <= 0:
+            continue
+        solidity = area / hull_area
+        if solidity < 0.85:
+            continue
+
+        # Score based on shape perfection and size
+        score = rectangularity * solidity * np.log1p(area)
+        if score > best_score:
+            best_score = score
+            # Return center x, center y, and the largest dimension as "size"
+            best_gate = (rcx, rcy, max(rw, rh))
+
+    if best_gate is not None:
+        return best_gate[0], best_gate[1], best_gate[2]
+
+    return None, None, None
+
 
 # ── flight controller ──────────────────────────────────────────────────────────
 
@@ -345,17 +416,27 @@ class GateController:
     # ── state: SEARCH ────────────────────────────────────────────────────────
 
     def search_for_gate(self):
-        """Yaw CCW at CRUISE_ALT until a gate rectangle is detected."""
-        print('  [SEARCH] scanning...')
+        """
+        Search logic: Continuous Sweep
+        Oscillates the yaw back and forth to scan the immediate area.
+        """
+        print('  [SEARCH] Sweeping...')
         t_start = time.time()
+
         while not self._stop:
+            # 1. Check the camera
             cx, cy, size = get_gate_detection(self._cam.latest_frame)
             if cx is not None:
                 print(f'  [SEARCH] gate found  cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px')
                 return
+
+            # 2. Execute flight pattern
             elapsed = time.time() - t_start
-            yaw     = SEARCH_YAW_RATE if elapsed < SEARCH_TIMEOUT else SEARCH_YAW_RATE * 2
-            self._safe_hover(yaw_rate=yaw, z=CRUISE_ALT)
+
+            # Oscillate yaw rate like a pendulum to sweep the camera
+            sweep_yaw_rate = math.sin(elapsed * math.pi) * SEARCH_YAW_RATE
+            self._safe_hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
+
             time.sleep(0.05)
 
     # ── state: APPROACH ──────────────────────────────────────────────────────
