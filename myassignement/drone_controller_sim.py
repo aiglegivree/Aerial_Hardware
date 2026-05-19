@@ -264,29 +264,50 @@ class UdpVideoThread(threading.Thread):
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+def _fill_holes(mask):
+    """Fill dark regions fully enclosed by white — turns a closed gate
+    outline into a solid rectangle so the contour shape tests are reliable."""
+    flood = mask.copy()
+    h, w = mask.shape
+    scratch = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(flood, scratch, (0, 0), 255)
+    return mask | cv2.bitwise_not(flood)
+
+
+# Gate-detection HSV mask. The gates are bright glowing LED frames, so we
+# threshold on high brightness (V) with low-to-moderate saturation (S), any
+# hue. Verified against myassignement/frames in noteboks/gate_detection.ipynb —
+# adaptive grayscale thresholding looks for DARK objects and missed the gates.
+GATE_HSV_LOWER = np.array([0,   0,   200], dtype=np.uint8)
+GATE_HSV_UPPER = np.array([255, 100, 255], dtype=np.uint8)
+
+
 def get_gate_detection(frame):
     """
-    Uses grayscale adaptive thresholding instead of HSV color filtering.
-    Returns: cx, cy, size (or None, None, None if nothing found)
+    Detect the bright LED gate frame.
+    Returns: cx, cy, size  (or None, None, None if no gate-shaped contour).
+
+    The gate is a bright rectangle on a dark background, so it is segmented
+    with an HSV brightness mask, then the most rectangular contour is picked.
     """
     if frame is None:
         return None, None, None
 
-    # Ensure image is grayscale
+    # Bright-LED mask in HSV space
     if len(frame.shape) == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        bgr = frame
     else:
-        gray = frame
+        bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, GATE_HSV_LOWER, GATE_HSV_UPPER)
 
-    # Adaptive thresholding: finds dark objects on light backgrounds (or vice versa)
-    thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
-    )
-
-    # Morphological operations to clean up noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # Close gaps along the thin gate edges, then fill the interior so the gate
+    # becomes a solid rectangle (a broken outline fails the shape tests below).
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((20, 5), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 20), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+    mask = _fill_holes(mask)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -709,38 +730,52 @@ class GateController:
         time.sleep(2)
 
         try:
-            self.takeoff()
+            self.takeoff(target_z=1.5)
 
-            for gate_idx in range(N_GATES):
-                if self._stop:
-                    break
-                print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
+            # ── TEST: hover and call detect_gate in a loop ─────────────────────
+            print('\n[TEST] Hovering at 1.5 m — calling get_gate_detection every tick')
+            while not self._stop:
+                cx, cy, size = get_gate_detection(self._cam.latest_frame)
+                if cx is not None:
+                    print(f'  [GATE DETECTED] cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px')
+                else:
+                    print('  [NO GATE]')
+                self._safe_hover(z=1.5)
+                time.sleep(0.1)
+            # ──────────────────────────────────────────────────────────────────
 
-                # Primary search: fly the patrol leg while watching the camera.
-                wx, wy = NO_GATE_WAYPOINTS[gate_idx]
-                result = self.fly_to_waypoint(wx, wy, CRUISE_ALT, scan=True)
-                if result == 'stopped':
-                    break
-
-                # Fallback: sweep-search only if the leg ended with no gate seen.
-                if result == 'reached':
-                    print('  [PATROL] waypoint reached, no gate in view '
-                          '— falling back to yaw search')
-                    self.search_for_gate()
-                    if self._stop:
-                        break
-
-                # A gate should now be in view. Approach + transit; if the gate
-                # is lost mid-approach, fall back to the yaw search and retry.
-                while not self._stop:
-                    if self.approach_gate():
-                        self.transit_gate()
-                        break
-                    print('  gate lost — falling back to yaw search')
-                    self.search_for_gate()
-
-            msg = 'All gates complete' if not self._stop else 'Emergency stop'
-            print(f'\n{msg} — landing')
+            # ── ORIGINAL MISSION CODE (commented out for testing) ─────────────
+            # for gate_idx in range(N_GATES):
+            #     if self._stop:
+            #         break
+            #     print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
+            #
+            #     # Primary search: fly the patrol leg while watching the camera.
+            #     wx, wy = NO_GATE_WAYPOINTS[gate_idx]
+            #     result = self.fly_to_waypoint(wx, wy, CRUISE_ALT, scan=True)
+            #     if result == 'stopped':
+            #         break
+            #
+            #     # Fallback: sweep-search only if the leg ended with no gate seen.
+            #     if result == 'reached':
+            #         print('  [PATROL] waypoint reached, no gate in view '
+            #               '— falling back to yaw search')
+            #         self.search_for_gate()
+            #         if self._stop:
+            #             break
+            #
+            #     # A gate should now be in view. Approach + transit; if the gate
+            #     # is lost mid-approach, fall back to the yaw search and retry.
+            #     while not self._stop:
+            #         if self.approach_gate():
+            #             self.transit_gate()
+            #             break
+            #         print('  gate lost — falling back to yaw search')
+            #         self.search_for_gate()
+            #
+            # msg = 'All gates complete' if not self._stop else 'Emergency stop'
+            # print(f'\n{msg} — landing')
+            # ──────────────────────────────────────────────────────────────────
 
         except Exception as e:
             print(f'\nUnhandled exception during mission: {e} — landing now')
