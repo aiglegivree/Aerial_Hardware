@@ -14,7 +14,6 @@ Keys:
   Esc    : same as Space + close window
 """
 import contextlib
-import math
 import os
 import socket
 import struct
@@ -80,14 +79,35 @@ class UdpVideoThread(QtCore.QThread):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         sock.bind(('0.0.0.0', LOCAL_PORT))
+        sock.settimeout(0.5)
         sock.sendto(START_MAGIC, (AIDECK_IP, AIDECK_PORT))
 
         buffer = bytearray()
         expected_size = 0
         receiving = False
+        last_frame_ts = time.time()
+        last_magic_ts = time.time()
 
         while True:
-            data, _ = sock.recvfrom(2048)
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                data = None
+
+            now = time.time()
+            # Watchdog: if we haven't seen a frame for >1s, re-poke the AI-deck.
+            if data is None or (now - last_frame_ts > 1.0):
+                if now - last_magic_ts > 1.0:
+                    try:
+                        sock.sendto(START_MAGIC, (AIDECK_IP, AIDECK_PORT))
+                    except OSError:
+                        pass
+                    last_magic_ts = now
+                    receiving = False
+                    buffer = bytearray()
+                if data is None:
+                    continue
+
             if len(data) < CPX_HEADER_SIZE:
                 continue
             payload = data[CPX_HEADER_SIZE:]
@@ -107,25 +127,27 @@ class UdpVideoThread(QtCore.QThread):
             buffer.extend(payload)
 
             if len(buffer) >= expected_size:
-                self._decode_and_emit(buffer)
+                if self._decode_and_emit(buffer):
+                    last_frame_ts = time.time()
                 receiving = False
 
     def _decode_and_emit(self, buffer):
         soi = buffer.find(b'\xff\xd8')
         eoi = buffer.rfind(b'\xff\xd9')
         if soi < 0 or eoi <= soi:
-            return
+            return False
         jpeg_len = eoi + 2 - soi
         if jpeg_len < MIN_JPEG_BYTES:
-            return
+            return False
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
         if img is None or img.shape[:2] != (IMG_HEIGHT, IMG_WIDTH):
-            return
+            return False
         if img.ndim == 3:
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.frame_ready.emit(img)
+        return True
 
 
 class MissionThread(QtCore.QThread):
@@ -201,7 +223,7 @@ class MissionThread(QtCore.QThread):
         t_end = time.time() + duration
         while time.time() < t_end and not self._stop:
             self._safe_hover(yaw_rate=yaw_rate, z=CRUISE_ALT)
-            time.sleep(0.05)
+            time.sleep(0.1)
 
     # ── public API ───────────────────────────────────────────────────────────
     def request_stop(self):
@@ -241,7 +263,7 @@ class MissionThread(QtCore.QThread):
                     t_end = time.time() + 3.0
                     while time.time() < t_end and not self._stop:
                         self._safe_hover(vx=0.2, z=CRUISE_ALT)
-                        time.sleep(0.05)
+                        time.sleep(0.1)
                     state = STATE_BACK
                     self.state_changed.emit(state)
 
@@ -250,7 +272,7 @@ class MissionThread(QtCore.QThread):
                     t_end = time.time() + 3.0
                     while time.time() < t_end and not self._stop:
                         self._safe_hover(vx=-0.2, z=CRUISE_ALT)
-                        time.sleep(0.05)
+                        time.sleep(0.1)
                     state = STATE_LAND
                     self.state_changed.emit(state)
 
