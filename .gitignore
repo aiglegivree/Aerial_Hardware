@@ -28,3 +28,7 @@ docs/api/cflib
 
 # uv lock file - not committed for libraries
 uv.lock
+
+
+.DS_Store
+
