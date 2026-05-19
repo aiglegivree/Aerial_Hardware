@@ -232,7 +232,7 @@ class UdpVideoThread(threading.Thread):
         jpeg = np.frombuffer(buf, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
+        if img is None:# or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
             return None
         if img.ndim == 2:
             return img
@@ -439,7 +439,7 @@ class Lap1Controller:
             print('NO FRAMES')
             return None
         self._last_frame_ts = ts
-q
+
         result = detect_gate(frame)
 
         if result['status'] == 'ok':

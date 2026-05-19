@@ -177,7 +177,7 @@ class UdpVideoThread(threading.Thread):
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
+        if img is None : #or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
             return None
         if img.ndim == 2:
             return img
