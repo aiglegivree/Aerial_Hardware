@@ -730,25 +730,44 @@ class GateController:
         time.sleep(2)
 
         try:
-            self.takeoff(target_z=1.5)
+            self.takeoff(target_z=1.0)
 
-            # ── TEST: hover and call detect_gate in a loop ─────────────────────
-            print('\n[TEST] Hovering at 1.5 m — calling get_gate_detection every tick')
+            # ── TEST: hover, detect gate, nudge toward it ─────────────────────
+            print('\n[TEST] Hovering at 1.0 m — calling get_gate_detection every tick')
             os.makedirs('gate_frames', exist_ok=True)
             frame_idx = 0
+            target_z  = 1.0
+            cx_mid    = CAM_WIDTH  / 2.0
+            cy_mid    = CAM_HEIGHT / 2.0
+
             while not self._stop:
                 frame = self._cam.latest_frame
                 cx, cy, size = get_gate_detection(frame)
+
                 if cx is not None:
-                    print(f'  [GATE DETECTED] cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px')
+                    # Lateral error (px): positive → gate is right of centre → strafe right
+                    lat_err  = cx - cx_mid
+                    vy       = clamp(KP_VY * lat_err, -MAX_VY, MAX_VY)
+
+                    # Vertical error (px): positive → gate is above centre → climb
+                    vert_err = cy_mid - cy
+                    target_z = clamp(1.0 + KP_VZ * vert_err,
+                                     1.0 - MAX_VZ_DELTA, 1.0 + MAX_VZ_DELTA)
+
+                    print(f'  [GATE DETECTED] cx={cx:.0f} cy={cy:.0f} size={size:.0f}px'
+                          f'  → vy={vy:+.3f} m/s  z={target_z:.2f} m')
+
                     if frame is not None:
                         path = os.path.join('gate_frames', f'gate_{frame_idx:04d}.png')
                         cv2.imwrite(path, frame)
                         print(f'  [SAVED] {path}')
                         frame_idx += 1
+
+                    self._safe_hover(vy=vy, z=target_z)
                 else:
-                    print('  [NO GATE]')
-                self._safe_hover(z=1.5)
+                    print('  [NO GATE] — holding position')
+                    self._safe_hover(z=target_z)
+
                 time.sleep(0.1)
             # ──────────────────────────────────────────────────────────────────
 
