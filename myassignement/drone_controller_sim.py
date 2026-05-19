@@ -937,6 +937,21 @@ class GateController:
 
 # ── emergency stop ─────────────────────────────────────────────────────────────
 
+def emergency_stop_callback(cf):
+    def on_press(key):
+        try:
+            if key.char == 'q':  # Check if the "space" key is pressed
+                print("Emergency stop triggered!")
+                cf.commander.send_stop_setpoint()  # Stop the Crazyflie
+                cf.close_link()  # Close the link to the Crazyflie
+                return False     # Stop the listener
+        except AttributeError:
+            pass
+
+    # Start listening for key presses
+    with keyboard.Listener(on_press=on_press) as listener:
+        listener.join()
+
 def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazyflie):
     """Press 'q' for emergency stop.
     Attempts a controlled landing first; if that fails, cuts motors immediately.
@@ -1031,11 +1046,9 @@ if __name__ == '__main__':
         exit(1)
 
     # Emergency stop listener
-    threading.Thread(
-        target=emergency_stop_listener,
-        args=(ctrl, cam, cf),
-        daemon=True
-    ).start()
+    # threading.Thread(target=emergency_stop_listener,args=(ctrl, cam, cf), daemon=True).start()
+    emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
+    emergency_stop_thread.start()
 
     try:
         if MISSION == 'vision':
