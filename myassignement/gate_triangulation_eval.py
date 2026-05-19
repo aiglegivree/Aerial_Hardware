@@ -464,34 +464,36 @@ class GateEvaluator:
     # ── log ──────────────────────────────────────────────────────────────────────
 
     def _setup_log(self):
-        lg = LogConfig(name='EvalState', period_in_ms=50)
+        # Split across two blocks: Crazyflie log limit is 26 bytes (6 floats) per block.
+        lg1 = LogConfig(name='EvalPos', period_in_ms=50)
         for v in ['stateEstimate.x', 'stateEstimate.y', 'stateEstimate.z',
-                  'stateEstimate.vx', 'stateEstimate.vy', 'stateEstimate.vz',
-                  'stabilizer.yaw',
+                  'stateEstimate.vx', 'stateEstimate.vy', 'stateEstimate.vz']:
+            lg1.add_variable(v, 'float')
+        lg2 = LogConfig(name='EvalAtt', period_in_ms=50)
+        for v in ['stabilizer.yaw',
                   'stateEstimate.qx', 'stateEstimate.qy',
                   'stateEstimate.qz', 'stateEstimate.qw']:
-            lg.add_variable(v, 'float')
+            lg2.add_variable(v, 'float')
         try:
-            self._cf.log.add_config(lg)
-            lg.data_received_cb.add_callback(self._log_cb)
-            lg.start()
+            self._cf.log.add_config(lg1)
+            lg1.data_received_cb.add_callback(self._log_cb)
+            lg1.start()
             self.is_connected = True
         except Exception as e:
-            print(f'Log setup failed: {e}')
+            print(f'Log setup failed (pos): {e}')
+        try:
+            self._cf.log.add_config(lg2)
+            lg2.data_received_cb.add_callback(self._log_cb)
+            lg2.start()
+        except Exception as e:
+            print(f'Log setup failed (att/quat): {e} — triangulation disabled')
 
     def _log_cb(self, timestamp, data, logconf):
         with self._log_lock:
-            self._log['x']   = data['stateEstimate.x']
-            self._log['y']   = data['stateEstimate.y']
-            self._log['z']   = data['stateEstimate.z']
-            self._log['vx']  = data['stateEstimate.vx']
-            self._log['vy']  = data['stateEstimate.vy']
-            self._log['vz']  = data['stateEstimate.vz']
-            self._log['yaw'] = data['stabilizer.yaw']
-            self._log['qx']  = data['stateEstimate.qx']
-            self._log['qy']  = data['stateEstimate.qy']
-            self._log['qz']  = data['stateEstimate.qz']
-            self._log['qw']  = data['stateEstimate.qw']
+            for full_key, val in data.items():
+                short = full_key.split('.')[-1]  # 'stateEstimate.x' → 'x', 'stabilizer.yaw' → 'yaw'
+                if short in self._log:
+                    self._log[short] = val
             snap = dict(self._log)
         self._state_buf.push(time.time(), snap)
         self._log_ready.set()

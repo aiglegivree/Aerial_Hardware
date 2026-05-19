@@ -60,7 +60,7 @@ TAKEOFF_DURATION = 4.0    # s
 LAND_DURATION    = 3.0    # s
 SETPOINT_PERIOD  = 0.05   # s  (20 Hz)
 
-SEARCH_YAW_RATE  = 15.0   # deg/s CCW rotation during search
+SEARCH_YAW_RATE  = 5.0   # deg/s CCW rotation during search
 LATERAL_DIST     = 0.5    # m — baseline between the two detection views
 REQ_FRAMES       = 5      # consecutive good detections needed (drone stationary)
 SPEED_THRESHOLD  = 0.10   # m/s — "stationary" guard (same as sim)
@@ -436,9 +436,10 @@ class Lap1Controller:
         """
         frame, ts = self._cam.latest_frame_with_ts
         if frame is None or ts == self._last_frame_ts:
+            print('NO FRAMES')
             return None
         self._last_frame_ts = ts
-
+q
         result = detect_gate(frame)
 
         if result['status'] == 'ok':
@@ -633,21 +634,21 @@ class Lap1Controller:
             while not self._stop:
                 s   = self._state()
                 det = self._detect()
-
+                print('DET : ', det)
                 # ── SEARCH ───────────────────────────────────────────────────────
                 if mission_state == SEARCH:
                     self._search_yaw_deg   += SEARCH_YAW_RATE * SETPOINT_PERIOD
                     self._search_yaw_total += SEARCH_YAW_RATE * SETPOINT_PERIOD
                     self._hold_yaw          = self._search_yaw_deg
 
-                    # after a full 360° with no gate: reposition 1 m forward
+                    ''' # after a full 360° with no gate: reposition 1 m forqqward
                     if self._search_yaw_total >= 360.0:
                         print('[SEARCH] full rotation, repositioning 1 m forward')
                         yaw_r = math.radians(s['yaw'])
                         self._hold_x += 1.0 * math.cos(yaw_r)
                         self._hold_y += 1.0 * math.sin(yaw_r)
                         self._search_yaw_total = 0.0
-
+                    '''
                     self._hold()
 
                     if det is not None:
