@@ -167,7 +167,9 @@ PRE_GATE_OFFSET  = 0.2   # m — waypoint placed before the gate along its appro
 POST_GATE_OFFSET = 0.2   # m — waypoint placed after the gate (clears the frame)
 
 POSITION_RATE_HZ   = 20.0  # setpoint streaming rate
-WAYPOINT_REACH_TOL = 0.15  # m — advance to next waypoint when within this
+WAYPOINT_REACH_TOL = 0.15  # m — final-waypoint reached tolerance
+PURSUIT_LOOKAHEAD  = 0.35  # m — carrot distance ahead of drone along the path
+                            #     larger = smoother + faster, smaller = tighter tracking
 
 
 # ── camera thread ──────────────────────────────────────────────────────────────
@@ -941,6 +943,87 @@ class GateController:
         waypoints.append((start_xyz[0], start_xyz[1], CRUISE_ALT, 0.0))
         return waypoints
 
+    def _follow_path_pure_pursuit(self, waypoints, dt):
+        """
+        Stream a moving carrot point along the polyline `waypoints`
+        (list of (x, y, z, yaw_rad)). At each tick we find the drone's closest
+        point on the path, then walk forward along segments by PURSUIT_LOOKAHEAD
+        metres to get the carrot, and send that as the position setpoint.
+
+        Yaw at the carrot is interpolated from the surrounding segment's yaws.
+        The path is considered finished when the projection reaches the final
+        segment and the drone is within WAYPOINT_REACH_TOL of the last point.
+        """
+        if len(waypoints) < 2:
+            return
+
+        pts = [np.array([w[0], w[1], w[2]]) for w in waypoints]
+        yaws = [w[3] for w in waypoints]
+        seg_idx = 0  # current segment is pts[seg_idx] → pts[seg_idx+1]
+
+        while not self._stop:
+            drone = np.array([self._state['x'], self._state['y'], self._state['z']])
+
+            # Project drone onto current segment; if past its end, advance.
+            while seg_idx < len(pts) - 2:
+                a, b = pts[seg_idx], pts[seg_idx + 1]
+                ab = b - a
+                ab_len2 = float(ab @ ab)
+                if ab_len2 < 1e-9:
+                    seg_idx += 1
+                    continue
+                t = float((drone - a) @ ab) / ab_len2
+                if t >= 1.0:
+                    seg_idx += 1
+                else:
+                    break
+
+            # Termination: on the last segment and near the final waypoint.
+            if seg_idx >= len(pts) - 1:
+                break
+            if seg_idx == len(pts) - 2:
+                if np.linalg.norm(drone - pts[-1]) < WAYPOINT_REACH_TOL:
+                    break
+
+            # Carrot: start from projection on current segment, then walk
+            # forward along the polyline by PURSUIT_LOOKAHEAD metres.
+            a, b = pts[seg_idx], pts[seg_idx + 1]
+            ab = b - a
+            ab_len = float(np.linalg.norm(ab))
+            if ab_len < 1e-9:
+                t = 0.0
+            else:
+                t = clamp(float((drone - a) @ ab) / (ab_len * ab_len), 0.0, 1.0)
+
+            remaining = PURSUIT_LOOKAHEAD
+            cur_seg = seg_idx
+            cur_t = t
+            carrot = a + t * ab
+            carrot_yaw = yaws[cur_seg + 1]
+            while remaining > 0 and cur_seg < len(pts) - 1:
+                sa, sb = pts[cur_seg], pts[cur_seg + 1]
+                seg_vec = sb - sa
+                seg_len = float(np.linalg.norm(seg_vec))
+                left = seg_len * (1.0 - cur_t)
+                if left >= remaining:
+                    cur_t += remaining / seg_len if seg_len > 1e-9 else 0.0
+                    carrot = sa + cur_t * seg_vec
+                    carrot_yaw = yaws[cur_seg + 1]
+                    remaining = 0
+                else:
+                    remaining -= left
+                    cur_seg += 1
+                    cur_t = 0.0
+                    if cur_seg >= len(pts) - 1:
+                        carrot = pts[-1]
+                        carrot_yaw = yaws[-1]
+                        break
+
+            self._cf.commander.send_position_setpoint(
+                float(carrot[0]), float(carrot[1]), float(carrot[2]),
+                math.degrees(carrot_yaw))
+            time.sleep(dt)
+
     def run_fast_lap(self, gates, n_laps=N_LAPS):
         """
         Part 2: gate positions are known. Stream raw (pre, centre, post)
@@ -970,18 +1053,9 @@ class GateController:
                 waypoints = self._plan_lap(gates, start_xyz)
 
                 t_lap = time.time()
-                for sx, sy, sz, syaw in waypoints:
-                    while not self._stop:
-                        self._cf.commander.send_position_setpoint(
-                            sx, sy, sz, math.degrees(syaw))
-                        dx = sx - self._state['x']
-                        dy = sy - self._state['y']
-                        dz = sz - self._state['z']
-                        if math.sqrt(dx*dx + dy*dy + dz*dz) < WAYPOINT_REACH_TOL:
-                            break
-                        time.sleep(dt)
-                    if self._stop:
-                        break
+                self._follow_path_pure_pursuit(waypoints, dt)
+                if self._stop:
+                    break
 
                 lap_times.append(time.time() - t_lap)
                 print(f'  Lap {lap + 1} time: {lap_times[-1]:.2f} s')
