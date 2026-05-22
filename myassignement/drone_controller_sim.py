@@ -87,7 +87,7 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
 # ── FPV viewer ────────────────────────────────────────────────────────────────
-FPV_ENABLED = True   # show live camera window with detection overlay
+FPV_ENABLED = False  # show live camera window with detection overlay
 FPV_SCALE   = 2      # upscale factor for the display window
 
 CPX_HEADER_SIZE  = 4
@@ -912,7 +912,7 @@ class GateController:
         os.makedirs('gate_frames', exist_ok=True)
         frame_idx    = [0]
         last_frame   = [None]
-        save_running = [True]
+        save_running = [False]  # DISABLED for frame-throughput test
 
         def _frame_saver():
             while save_running[0]:
@@ -924,8 +924,8 @@ class GateController:
                     frame_idx[0]  += 1
                 time.sleep(0.05)   # ~20 fps
 
-        threading.Thread(target=_frame_saver, daemon=True, name='FrameSaver').start()
-        print(f'[FRAME SAVER] saving to gate_frames/')
+        # threading.Thread(target=_frame_saver, daemon=True, name='FrameSaver').start()
+        print(f'[FRAME SAVER] DISABLED')
         # ──────────────────────────────────────────────────────────────────────
 
         try:
@@ -938,13 +938,8 @@ class GateController:
                 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
 
-                # 1. Sweep yaw until the gate appears in frame, then hover to
-                #    confirm the detection is stable before committing.
-                while not self._stop:
-                    self.search_for_gate()
-                    if self._stop or self.lock_on_gate():
-                        break
-
+                # 1. Sweep yaw until the gate appears in frame
+                self.search_for_gate()
                 if self._stop:
                     break
 
@@ -954,10 +949,7 @@ class GateController:
                         self.transit_gate()
                         break
                     print('  gate lost — searching again')
-                    while not self._stop:
-                        self.search_for_gate()
-                        if self._stop or self.lock_on_gate():
-                            break
+                    self.search_for_gate()
 
             msg = 'All gates complete' if not self._stop else 'Emergency stop'
             print(f'\n{msg} — landing')
