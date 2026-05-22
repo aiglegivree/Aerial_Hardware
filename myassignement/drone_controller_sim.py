@@ -87,8 +87,12 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
 # ── FPV viewer ────────────────────────────────────────────────────────────────
-FPV_ENABLED = False  # show live camera window with detection overlay
-FPV_SCALE   = 2      # upscale factor for the display window
+FPV_ENABLED  = False  # show live camera window with detection overlay
+FPV_SCALE    = 2      # upscale factor for the display window
+FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
+                       # (kept low so the UDP receiver thread isn't GIL-starved
+                       #  — that was causing the AI-deck stream to stall after
+                       #  the first frame)
 
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
@@ -167,6 +171,7 @@ TRAJ_VEL_LIM     = 5.0  # m/s — planner velocity ceiling (high: real speed set
 TRAJ_ACC_LIM     = 5.0  # m/s² — planner acceleration ceiling
 TRAJ_DISC_STEPS  = 20    # trajectory setpoints generated per segment
 POSITION_RATE_HZ = 20.0  # trajectory setpoint streaming rate
+WAYPOINT_REACH_TOL = 0.15  # m — advance to next trajectory setpoint when within this
 GATE_INWARD_BIAS = 0.0   # m — shift pre/post waypoints toward arena origin
                          #     to tighten the racing line. Start at 0, try
                          #     0.1–0.3 once basic laps work. Capped at
@@ -345,10 +350,22 @@ class FpvViewerThread(threading.Thread):
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE)
         last = None
+        period = 1.0 / max(1.0, FPV_RATE_HZ)
+        next_t = time.time()
         while self._running:
+            # Throttle the loop with time.sleep (releases the GIL cleanly so
+            # the UDP receiver thread can keep up with incoming packets).
+            now = time.time()
+            if now < next_t:
+                time.sleep(min(period, next_t - now))
+                # Still pump the GUI event queue so the window stays responsive
+                cv2.waitKey(1)
+                continue
+            next_t = now + period
+
             frame = self._cam.latest_frame
             if frame is None or frame is last:
-                cv2.waitKey(30)
+                cv2.waitKey(1)
                 continue
             last = frame
             disp = frame.copy()
@@ -1126,18 +1143,23 @@ class GateController:
                     break
 
                 setpoints = planner.trajectory_setpoints
-                times = planner.time_setpoints
 
-                # Follow the trajectory open-loop: index by elapsed time.
+                # Follow the trajectory spatially: advance to the next setpoint
+                # once the drone is within WAYPOINT_REACH_TOL of the current one,
+                # rather than assuming it tracks the time-indexed plan exactly.
                 t_lap = time.time()
-                while not self._stop:
-                    elapsed = time.time() - t_lap
-                    if elapsed >= times[-1]:
-                        break
-                    n = min(int(np.searchsorted(times, elapsed)), len(setpoints) - 1)
+                n = 0
+                last_n = len(setpoints) - 1
+                while not self._stop and n <= last_n:
                     sx, sy, sz, syaw = setpoints[n]
                     self._cf.commander.send_position_setpoint(
                         sx, sy, sz, math.degrees(syaw))
+
+                    dx = sx - self._state['x']
+                    dy = sy - self._state['y']
+                    dz = sz - self._state['z']
+                    if math.sqrt(dx*dx + dy*dy + dz*dz) < WAYPOINT_REACH_TOL:
+                        n += 1
                     time.sleep(dt)
 
                 lap_times.append(time.time() - t_lap)
