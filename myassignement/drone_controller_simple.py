@@ -114,15 +114,23 @@ TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
 # IBVS gains — tune these on the real drone
-KP_VX        = 0.010  # size error  (GATE_SIZE_CLOSE - size) → forward speed
+KP_VX        = 0.008  # size error  (GATE_SIZE_CLOSE - size) → forward speed
 KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
 KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
-MAX_VX       = 0.25    # m/s — forward cap (never backward)
-MAX_VY       = 0.25   # m/s — strafe cap
+MAX_VX       = 0.15   # m/s — forward cap (never backward)
+MAX_VY       = 0.20   # m/s — strafe cap
 MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
-TRANSIT_VX   = 0.5    # m/s
-TRANSIT_TIME = 2.0    # s
+# Alignment gating for APPROACH → TRANSIT handoff
+ALIGN_TOL_X      = 25   # px — |cx - cx_mid| must be under this to allow TRANSIT
+ALIGN_TOL_Y      = 25   # px — |cy_mid - cy| must be under this to allow TRANSIT
+# Forward speed is scaled by how well-aligned the gate is in the frame. When
+# pixel error fills this fraction of the frame, vx is throttled to zero —
+# the drone strafes/climbs in place until the gate is roughly centred.
+ALIGN_SCALE_DENOM = 0.6  # fraction of half-frame at which vx → 0
+
+TRANSIT_VX   = 0.30   # m/s — slower than before; still open-loop forward push
+TRANSIT_TIME = 1.5    # s
 
 SEARCH_YAW_RATE = 15.0  # deg/s CCW
 SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
@@ -691,15 +699,16 @@ class GateController:
 
             lost = 0
 
-            # ── Step 1: check termination ───────────────────────────────────
-            if size >= GATE_SIZE_CLOSE:
-                print(f'  [APPROACH] gate fills frame (size={size:.0f}px) → TRANSIT')
-                return True
-
-            # ── Step 2: pixel errors ────────────────────────────────────────
-            e_x = -cx + cx_mid          # +ve → gate right of centre
-            e_y = cy_mid - cy          # +ve → gate above centre
+            # ── Step 1: pixel errors ────────────────────────────────────────
+            e_x = -cx + cx_mid          # +ve → gate left of centre (strafe left)
+            e_y = cy_mid - cy           # +ve → gate above centre
             e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small → move forward
+
+            # ── Step 2: check termination — only TRANSIT if also aligned ────
+            if size >= GATE_SIZE_CLOSE and abs(e_x) < ALIGN_TOL_X and abs(e_y) < ALIGN_TOL_Y:
+                print(f'  [APPROACH] gate fills frame & aligned (size={size:.0f}px '
+                      f'ex={e_x:+.0f} ey={e_y:+.0f}) → TRANSIT')
+                return True
 
             # ── Step 3: proportional control ────────────────────────────────
             v_strafe  = KP_VY * e_x
@@ -711,11 +720,21 @@ class GateController:
             v_climb   = clamp(v_climb,   -MAX_VZ_DELTA, MAX_VZ_DELTA)
             v_forward = clamp(v_forward,  0.0,     MAX_VX)   # never fly backward
 
+            # ── Step 4b: throttle forward speed by alignment ────────────────
+            # When the gate is off-centre, slow forward motion so the drone
+            # has time to strafe/climb into alignment instead of barrelling
+            # diagonally toward the gate plane.
+            mis_x = abs(e_x) / cx_mid   # 0 = centred, 1 = at frame edge
+            mis_y = abs(e_y) / cy_mid
+            align_factor = clamp(1.0 - (mis_x + mis_y) / ALIGN_SCALE_DENOM, 0.0, 1.0)
+            v_forward *= align_factor
+
             target_z  = clamp(CRUISE_ALT + v_climb,
                               CRUISE_ALT - MAX_VZ_DELTA,
                               CRUISE_ALT + MAX_VZ_DELTA)
 
             print(f'  [IBVS] ex={e_x:+.0f}px ey={e_y:+.0f}px size={size:.0f}px'
+                  f'  align={align_factor:.2f}'
                   f'  → vx={v_forward:.2f} vy={v_strafe:+.2f} z={target_z:.2f}')
 
             # ── Step 5: send command ─────────────────────────────────────────
@@ -727,11 +746,31 @@ class GateController:
     # ── state: TRANSIT ───────────────────────────────────────────────────────
 
     def transit_gate(self):
-        """Push straight forward for TRANSIT_TIME to clear the gate."""
+        """
+        Push forward to clear the gate. For as long as the detector still sees
+        the gate (i.e. we haven't passed the plane yet) keep correcting lateral
+        and vertical pixel error so a late drift doesn't clip the frame. Once
+        the gate disappears from view, finish the push open-loop.
+        """
         print('  [TRANSIT] flying through gate')
+        cx_mid = CAM_WIDTH  / 2.0
+        cy_mid = CAM_HEIGHT / 2.0
+        target_z = CRUISE_ALT
         t_end = time.time() + TRANSIT_TIME
         while time.time() < t_end and not self._stop:
-            self._safe_hover(vx=TRANSIT_VX, z=CRUISE_ALT)
+            cx, cy, _size = get_gate_detection(self._cam.latest_frame)
+            if cx is not None:
+                e_x = -cx + cx_mid
+                e_y = cy_mid - cy
+                v_strafe = clamp(KP_VY * e_x, -MAX_VY, MAX_VY)
+                v_climb  = clamp(KP_VZ * e_y, -MAX_VZ_DELTA, MAX_VZ_DELTA)
+                target_z = clamp(CRUISE_ALT + v_climb,
+                                 CRUISE_ALT - MAX_VZ_DELTA,
+                                 CRUISE_ALT + MAX_VZ_DELTA)
+                self._safe_hover(vx=TRANSIT_VX, vy=v_strafe, z=target_z)
+            else:
+                # Gate no longer visible → we are past the plane, finish straight
+                self._safe_hover(vx=TRANSIT_VX, z=target_z)
             time.sleep(0.05)
         print('  [TRANSIT] done')
 
