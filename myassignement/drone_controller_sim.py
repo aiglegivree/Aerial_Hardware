@@ -101,7 +101,7 @@ SAFETY_MARGIN_HARD = 0.15  # m — never fly closer than this to a wall
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
-CRUISE_ALT       = 0.6   # m ## The height position of the drone
+CRUISE_ALT       = 1.25  # m ## The height position of the drone
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
@@ -109,15 +109,15 @@ LAND_DURATION    = 3.0   # s
 KP_VX        = 0.010  # size error  (GATE_SIZE_CLOSE - size) → forward speed
 KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
 KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
-MAX_VX       = 1.0    # m/s — forward cap (never backward)
-MAX_VY       = 0.5    # m/s — strafe cap
+MAX_VX       = 0.25    # m/s — forward cap (never backward)
+MAX_VY       = 0.25   # m/s — strafe cap
 MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
 TRANSIT_VX   = 0.5    # m/s
 TRANSIT_TIME = 2.0    # s
 
-SEARCH_YAW_RATE = 5.0  # deg/s CCW
-SEARCH_TIMEOUT  = 10.0  # s — double yaw rate after this
+SEARCH_YAW_RATE = 15.0  # deg/s CCW
+SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
 LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
 
 N_GATES = 5  # Part 1 vision gates to search for 
@@ -137,7 +137,7 @@ WAYPOINT_YAW_KP    = 1.5   # heading error (deg) → yaw rate (deg/s)
 # One patrol waypoint per gate, evenly spaced counter-clockwise around the
 # circle. Replace with explicit (x, y) coordinates once you know your arena.
 NO_GATE_WAYPOINTS = [
-    (0, -0.2)
+    (0.65, -0.74, 1.28, 58), (1.78, -0.92, 1.13, 100), (2.22, 0.05, 1.42, 188), (1.52, 0.83, 1.17, 233), (0.51, 0.9, 1.28, 280)
 ]
 
 
@@ -651,7 +651,7 @@ class GateController:
                 return True
 
             # ── Step 2: pixel errors ────────────────────────────────────────
-            e_x = cx - cx_mid          # +ve → gate right of centre
+            e_x = -cx + cx_mid          # +ve → gate right of centre
             e_y = cy_mid - cy          # +ve → gate above centre
             e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small → move forward
 
