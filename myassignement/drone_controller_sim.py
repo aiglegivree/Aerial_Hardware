@@ -744,6 +744,26 @@ class GateController:
         self._cf.param.set_value('kalman.resetEstimation', '0')
         time.sleep(2)
 
+        # ── background frame saver ─────────────────────────────────────────────
+        os.makedirs('gate_frames', exist_ok=True)
+        frame_idx    = [0]
+        last_frame   = [None]
+        save_running = [True]
+
+        def _frame_saver():
+            while save_running[0]:
+                frame = self._cam.latest_frame
+                if frame is not None and frame is not last_frame[0]:
+                    path = os.path.join('gate_frames', f'frame_{frame_idx[0]:05d}.png')
+                    cv2.imwrite(path, frame)
+                    last_frame[0]  = frame
+                    frame_idx[0]  += 1
+                time.sleep(0.05)   # ~20 fps
+
+        threading.Thread(target=_frame_saver, daemon=True, name='FrameSaver').start()
+        print(f'[FRAME SAVER] saving to gate_frames/')
+        # ──────────────────────────────────────────────────────────────────────
+
         try:
             self.takeoff(target_z=1.0)
 
@@ -805,6 +825,8 @@ class GateController:
             print(f'\nUnhandled exception during mission: {e} — landing now')
 
         finally:
+            save_running[0] = False
+            print(f'[FRAME SAVER] stopped — {frame_idx[0]} frames saved to gate_frames/')
             # Always attempt a controlled landing, whatever happened above.
             # _stop_motors() is NOT called here — land() does a gradual descent
             # and only cuts motors at the end, so the drone doesn't just drop.
