@@ -1042,20 +1042,44 @@ def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazy
     Attempts a controlled landing first; if that fails, cuts motors immediately.
     Press 'q' a second time to skip the landing and cut motors instantly.
     """
-    stop_count = [0]
+    #stop_count = [0]
 
     def on_press(key):
-        try:
-            if key.char != 'q':
-                return
-        except AttributeError:
-            return
+        # try:
+        #     if key.char != 'q':
+        #         return
+        # except AttributeError:
+        #     return
 
-        stop_count[0] += 1
-        ctrl._stop = True
+        # stop_count[0] += 1
+        # ctrl._stop = True
 
-        if stop_count[0] == 1:
-            print('\n[EMERGENCY STOP] landing — press Q again to cut motors immediately')
+        # if stop_count[0] == 1:
+        #     print('\n[EMERGENCY STOP] landing — press Q again to cut motors immediately')
+        #     try:
+        #         ctrl.land()
+        #     except Exception as e:
+        #         print(f'Land failed ({e}) — cutting motors')
+        #         ctrl._stop_motors()
+        #     finally:
+        #         if cam is not None:
+        #             cam.stop()
+        #         cf.close_link()
+        #     return False
+
+        # elif stop_count[0] >= 2:
+        #     print('\n[EMERGENCY STOP] cutting motors immediately')
+        #     ctrl._stop_motors()
+        #     if cam is not None:
+        #         cam.stop()
+        #     cf.close_link()
+        #     return False
+        # ESC → controlled landing
+        if key == keyboard.Key.esc:
+            print('\n[EMERGENCY STOP] landing')
+
+            ctrl._stop = True
+
             try:
                 ctrl.land()
             except Exception as e:
@@ -1065,15 +1089,25 @@ def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazy
                 if cam is not None:
                     cam.stop()
                 cf.close_link()
+
             return False
 
-        elif stop_count[0] >= 2:
-            print('\n[EMERGENCY STOP] cutting motors immediately')
-            ctrl._stop_motors()
-            if cam is not None:
-                cam.stop()
-            cf.close_link()
-            return False
+        # Q → immediate kill
+        try:
+            if key.char == 'q':
+                print('\n[EMERGENCY STOP] cutting motors immediately')
+
+                ctrl._stop = True
+                ctrl._stop_motors()
+
+                if cam is not None:
+                    cam.stop()
+
+                cf.close_link()
+
+                return False
+        except AttributeError:
+            pass
 
     with keyboard.Listener(on_press=on_press) as listener:
         listener.join()
@@ -1132,7 +1166,8 @@ if __name__ == '__main__':
 
     # Emergency stop listener
     # threading.Thread(target=emergency_stop_listener,args=(ctrl, cam, cf), daemon=True).start()
-    emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
+    # emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
+    emergency_stop_thread = threading.Thread(target=emergency_stop_listener, args=(ctrl, cam, cf), daemon=True)
     emergency_stop_thread.start()
 
     try:
