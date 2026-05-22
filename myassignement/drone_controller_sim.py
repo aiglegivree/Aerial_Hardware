@@ -101,7 +101,7 @@ SAFETY_MARGIN_HARD = 0.15  # m — never fly closer than this to a wall
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
-CRUISE_ALT       = 0.6   # m ## The height position of the drone
+CRUISE_ALT       = 1.25  # m ## The height position of the drone
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
@@ -109,15 +109,15 @@ LAND_DURATION    = 3.0   # s
 KP_VX        = 0.010  # size error  (GATE_SIZE_CLOSE - size) → forward speed
 KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
 KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
-MAX_VX       = 1.0    # m/s — forward cap (never backward)
-MAX_VY       = 0.5    # m/s — strafe cap
+MAX_VX       = 0.25    # m/s — forward cap (never backward)
+MAX_VY       = 0.25   # m/s — strafe cap
 MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
 TRANSIT_VX   = 0.5    # m/s
 TRANSIT_TIME = 2.0    # s
 
-SEARCH_YAW_RATE = 5.0  # deg/s CCW
-SEARCH_TIMEOUT  = 10.0  # s — double yaw rate after this
+SEARCH_YAW_RATE = 15.0  # deg/s CCW
+SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
 LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
 
 N_GATES = 5  # Part 1 vision gates to search for 
