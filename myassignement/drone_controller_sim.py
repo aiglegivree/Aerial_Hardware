@@ -128,7 +128,7 @@ LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
 # detect, then commit to APPROACH.
 LOCK_DURATION   = 1.5   # s — hover-and-confirm window
 
-N_GATES = 5  # Part 1 vision gates to search for 
+N_GATES = 5  # Part 1 vision gates to search for
 
 # ── Part 1: patrol search path ─────────────────────────────────────────────────
 #
@@ -932,17 +932,22 @@ class GateController:
         # ──────────────────────────────────────────────────────────────────────
 
         try:
-            self.takeoff(target_z=1.0)
+            self.takeoff(target_z=CRUISE_ALT)
 
             # ── SIMPLE MISSION: search → approach → transit × N_GATES ──────────
             for gate_idx in range(N_GATES):
                 if self._stop:
                     break
-                
+
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
 
-                # 1. Sweep yaw until the gate appears in frame
-                self.search_for_gate()
+                # 1. Sweep yaw until the gate appears in frame, then hover to
+                #    confirm the detection is stable before committing.
+                while not self._stop:
+                    self.search_for_gate()
+                    if self._stop or self.lock_on_gate():
+                        break
+
                 if self._stop:
                     break
 
@@ -952,7 +957,10 @@ class GateController:
                         self.transit_gate()
                         break
                     print('  gate lost — searching again')
-                    self.search_for_gate()
+                    while not self._stop:
+                        self.search_for_gate()
+                        if self._stop or self.lock_on_gate():
+                            break
 
             msg = 'All gates complete' if not self._stop else 'Emergency stop'
             print(f'\n{msg} — landing')
