@@ -70,7 +70,7 @@ logging.basicConfig(level=logging.ERROR)
 
 # ── mission selection ──────────────────────────────────────────────────────────
 
-MISSION = 'vision'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
+MISSION = 'position'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
 
 # ── connection ─────────────────────────────────────────────────────────────────
 
