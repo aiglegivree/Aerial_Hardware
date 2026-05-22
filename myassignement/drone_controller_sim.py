@@ -741,7 +741,7 @@ class GateController:
             elapsed = time.time() - t_start
 
             # Oscillate yaw rate like a pendulum to sweep the camera
-            sweep_yaw_rate = math.sin(elapsed * math.pi / 3.0) * SEARCH_YAW_RATE
+            sweep_yaw_rate = math.sin(elapsed * math.pi / 5) * SEARCH_YAW_RATE
             self._safe_hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
 
             time.sleep(0.05)
@@ -749,7 +749,7 @@ class GateController:
     # ── state: LOCK ──────────────────────────────────────────────────────────
 
     def lock_on_gate(self):
-        """
+        """q
         After SEARCH first spots a gate, stop yawing and hover in place for
         LOCK_DURATION seconds, polling the detector each tick. Returns True
         if a gate is still in frame at the end of the window, else False
