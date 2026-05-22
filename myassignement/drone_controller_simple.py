@@ -70,7 +70,7 @@ logging.basicConfig(level=logging.ERROR)
 
 # ── mission selection ──────────────────────────────────────────────────────────
 
-MISSION = 'position'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
+MISSION = 'vision'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
 
 # ── connection ─────────────────────────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ ARENA_X_MAX = +3.0   # m — front wall
 ARENA_Y_MIN = -0.9   # m — right wall
 ARENA_Y_MAX = +0.9   # m — left wall
 
-SAFETY_MARGIN_HARD = 0.075  # m — never fly closer than this to a wall
+SAFETY_MARGIN_HARD = 0.00000  # m — never fly closer than this to a wall
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
@@ -149,18 +149,16 @@ WAYPOINT_YAW_KP    = 1.5   # heading error (deg) → yaw rate (deg/s)
 # One patrol waypoint per gate, evenly spaced counter-clockwise around the
 # circle. Replace with explicit (x, y) coordinates once you know your arena.
 GATE_HEIGHT = 0.4
-NO_GATE_WAYPOINTS = [
-    (0.65, -0.74, 1.28, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.78, -0.92, 1.13, np.deg2rad(100), 0.29, GATE_HEIGHT),
-    (2.22, 0.05, 1.42, np.deg2rad(188), 0.4, GATE_HEIGHT), (1.52, 0.83, 1.17, np.deg2rad(233), 0.4, GATE_HEIGHT),
-    (0.51, 0.9, 1.28, np.deg2rad(280), 0.29, GATE_HEIGHT)
-]
+NO_GATE_WAYPOINTS = []
 
 
 # ── Part 2: position-based mission ─────────────────────────────────────────────
 #
 # Fill GATE_POSITIONS once the instructor gives you the exact gate positions.
 # Each gate entry will be (x, y, z, theta, height, width)
-GATE_POSITIONS = []
+GATE_POSITIONS = [    (0.65, -0.74, 1.28, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.78, -0.92, 1.13, np.deg2rad(100), 0.29, GATE_HEIGHT),
+    (2.22, 0.05, 1.42, np.deg2rad(188), 0.4, GATE_HEIGHT), (1.52, 0.83, 1.17, np.deg2rad(233), 0.4, GATE_HEIGHT),
+    (0.51, 0.9, 1.28, np.deg2rad(280), 0.29, GATE_HEIGHT)]
 
 N_LAPS           = 2     # number of timed laps
 PRE_GATE_OFFSET  = 0.2   # m — waypoint placed before the gate along its approach axis

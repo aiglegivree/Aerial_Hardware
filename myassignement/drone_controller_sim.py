@@ -70,7 +70,7 @@ logging.basicConfig(level=logging.ERROR)
 
 # ── mission selection ──────────────────────────────────────────────────────────
 
-MISSION = 'position'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
+MISSION = 'vision'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
 
 # ── connection ─────────────────────────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ ARENA_X_MAX = +3.0   # m — front wall
 ARENA_Y_MIN = -0.9   # m — right wall
 ARENA_Y_MAX = +0.9   # m — left wall
 
-SAFETY_MARGIN_HARD = 0.15  # m — never fly closer than this to a wall
+SAFETY_MARGIN_HARD = 0.0000000  # m — never fly closer than this to a wall
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
