@@ -86,6 +86,10 @@ UDP_START_MAGIC = b'FER'
 CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
+# ── FPV viewer ────────────────────────────────────────────────────────────────
+FPV_ENABLED = False  # show live camera window with detection overlay
+FPV_SCALE   = 2      # upscale factor for the display window
+
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
@@ -264,6 +268,137 @@ class UdpVideoThread(threading.Thread):
         if img.ndim == 2:
             return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return img
+
+
+# ── FPV viewer thread ─────────────────────────────────────────────────────────
+
+class FpvViewerThread(threading.Thread):
+    """
+    Live FPV window. Polls the camera's latest frame, runs the gate detector
+    for an overlay (center crosshair + size + bounding info), and displays
+    via cv2.imshow. Press 'q' inside the window to close it (mission keeps
+    running; emergency stop is handled by the pynput listener).
+    """
+
+    def __init__(self, cam: 'UdpVideoThread', ctrl=None):
+        super().__init__(daemon=True, name='FpvViewerThread')
+        self._cam = cam
+        self._ctrl = ctrl
+        self._running = False
+
+    def start(self):
+        self._running = True
+        super().start()
+
+    def stop(self):
+        self._running = False
+
+    @staticmethod
+    def _detect_overlay(frame):
+        """
+        Re-runs the gate-detection pipeline (independently from the control
+        path) and returns drawable data: the winning rotated rect plus a list
+        of rejected contour rects, so the FPV view can visualize the detector.
+        """
+        bgr = frame if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, GATE_HSV_LOWER, GATE_HSV_UPPER)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((20, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 20), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+        mask = _fill_holes(mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_score = 0.0
+        best_rect = None
+        rejected = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 250:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rw, rh), _ = rect
+            if rw < 10 or rh < 10:
+                continue
+            short_side, long_side = sorted([rw, rh])
+            aspect = short_side / long_side
+            rotated_area = rw * rh
+            rectangularity = area / rotated_area
+            hull_area = cv2.contourArea(cv2.convexHull(cnt))
+            solidity = area / hull_area if hull_area > 0 else 0.0
+            if aspect < 0.45 or rectangularity < 0.80 or solidity < 0.85:
+                rejected.append(rect)
+                continue
+            score = rectangularity * solidity * np.log1p(area)
+            if score > best_score:
+                if best_rect is not None:
+                    rejected.append(best_rect)
+                best_score = score
+                best_rect = rect
+            else:
+                rejected.append(rect)
+        return mask, best_rect, rejected
+
+    def run(self):
+        win = 'Crazyflie FPV'
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE)
+        last = None
+        while self._running:
+            frame = self._cam.latest_frame
+            if frame is None or frame is last:
+                cv2.waitKey(30)
+                continue
+            last = frame
+            disp = frame.copy()
+
+            # Detection overlay (re-run independently of control)
+            _mask, best_rect, rejected = self._detect_overlay(frame)
+            cv2.line(disp, (CAM_WIDTH // 2, 0), (CAM_WIDTH // 2, CAM_HEIGHT),
+                     (60, 60, 60), 1)
+            cv2.line(disp, (0, CAM_HEIGHT // 2), (CAM_WIDTH, CAM_HEIGHT // 2),
+                     (60, 60, 60), 1)
+
+            # Rejected candidates in faint red
+            for rect in rejected:
+                box = cv2.boxPoints(rect).astype(np.int32)
+                cv2.drawContours(disp, [box], 0, (0, 0, 180), 1)
+
+            if best_rect is not None:
+                (rcx, rcy), (rw, rh), _ = best_rect
+                size = max(rw, rh)
+                color = (0, 255, 0) if size >= GATE_SIZE_CLOSE else (0, 200, 255)
+                box = cv2.boxPoints(best_rect).astype(np.int32)
+                cv2.drawContours(disp, [box], 0, color, 2)
+                cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
+                               cv2.MARKER_CROSS, 14, 2)
+                cv2.putText(disp,
+                            f'cx={rcx:.0f} cy={rcy:.0f} size={size:.0f}',
+                            (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            else:
+                cv2.putText(disp, 'no gate', (5, 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+            # Pose overlay
+            if self._ctrl is not None:
+                s = self._ctrl._state
+                cv2.putText(disp,
+                            f"x={s['x']:+.2f} y={s['y']:+.2f} z={s['z']:.2f} yaw={s['yaw']:+.0f}",
+                            (5, CAM_HEIGHT - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.42, (255, 255, 255), 1)
+
+            if FPV_SCALE != 1:
+                disp = cv2.resize(disp,
+                                  (CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE),
+                                  interpolation=cv2.INTER_NEAREST)
+            cv2.imshow(win, disp)
+            if (cv2.waitKey(1) & 0xFF) == ord('Q'):  # capital Q only — lowercase q is emergency stop
+                break
+        try:
+            cv2.destroyWindow(win)
+        except Exception:
+            pass
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -609,7 +744,7 @@ class GateController:
             elapsed = time.time() - t_start
 
             # Oscillate yaw rate like a pendulum to sweep the camera
-            sweep_yaw_rate = math.sin(elapsed * math.pi / 3.0) * SEARCH_YAW_RATE
+            sweep_yaw_rate = math.sin(elapsed * math.pi / 5) * SEARCH_YAW_RATE
             self._safe_hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
 
             time.sleep(0.05)
@@ -617,7 +752,7 @@ class GateController:
     # ── state: LOCK ──────────────────────────────────────────────────────────
 
     def lock_on_gate(self):
-        """
+        """q
         After SEARCH first spots a gate, stop yawing and hover in place for
         LOCK_DURATION seconds, polling the detector each tick. Returns True
         if a gate is still in frame at the end of the window, else False
@@ -780,7 +915,7 @@ class GateController:
         os.makedirs('gate_frames', exist_ok=True)
         frame_idx    = [0]
         last_frame   = [None]
-        save_running = [True]
+        save_running = [False]  # DISABLED for frame-throughput test
 
         def _frame_saver():
             while save_running[0]:
@@ -792,8 +927,8 @@ class GateController:
                     frame_idx[0]  += 1
                 time.sleep(0.05)   # ~20 fps
 
-        threading.Thread(target=_frame_saver, daemon=True, name='FrameSaver').start()
-        print(f'[FRAME SAVER] saving to gate_frames/')
+        # threading.Thread(target=_frame_saver, daemon=True, name='FrameSaver').start()
+        print(f'[FRAME SAVER] DISABLED')
         # ──────────────────────────────────────────────────────────────────────
 
         try:
@@ -806,13 +941,8 @@ class GateController:
                 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
 
-                # 1. Sweep yaw until the gate appears in frame, then hover to
-                #    confirm the detection is stable before committing.
-                while not self._stop:
-                    self.search_for_gate()
-                    if self._stop or self.lock_on_gate():
-                        break
-
+                # 1. Sweep yaw until the gate appears in frame
+                self.search_for_gate()
                 if self._stop:
                     break
 
@@ -822,10 +952,7 @@ class GateController:
                         self.transit_gate()
                         break
                     print('  gate lost — searching again')
-                    while not self._stop:
-                        self.search_for_gate()
-                        if self._stop or self.lock_on_gate():
-                            break
+                    self.search_for_gate()
 
             msg = 'All gates complete' if not self._stop else 'Emergency stop'
             print(f'\n{msg} — landing')
@@ -1167,6 +1294,13 @@ if __name__ == '__main__':
         cf.close_link()
         exit(1)
 
+    # Live FPV window with detection overlay
+    fpv = None
+    if FPV_ENABLED and cam is not None:
+        fpv = FpvViewerThread(cam, ctrl)
+        fpv.start()
+        print('FPV viewer started')
+
     # Emergency stop listener
     # threading.Thread(target=emergency_stop_listener,args=(ctrl, cam, cf), daemon=True).start()
     # emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
@@ -1179,6 +1313,8 @@ if __name__ == '__main__':
         else:
             ctrl.run_fast_lap(GATE_POSITIONS, N_LAPS)
     finally:
+        if fpv is not None:
+            fpv.stop()
         if cam is not None:
             cam.stop()
         cf.close_link()
