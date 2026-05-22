@@ -120,6 +120,10 @@ SEARCH_YAW_RATE = 15.0  # deg/s CCW
 SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
 LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
 
+# After SEARCH spots a gate, hold position for this long while continuing to
+# detect, then commit to APPROACH.
+LOCK_DURATION   = 1.5   # s — hover-and-confirm window
+
 N_GATES = 5  # Part 1 vision gates to search for 
 
 # ── Part 1: patrol search path ─────────────────────────────────────────────────
@@ -607,6 +611,31 @@ class GateController:
 
             time.sleep(0.05)
 
+    # ── state: LOCK ──────────────────────────────────────────────────────────
+
+    def lock_on_gate(self):
+        """
+        After SEARCH first spots a gate, stop yawing and hover in place for
+        LOCK_DURATION seconds, polling the detector each tick. Returns True
+        if a gate is still in frame at the end of the window, else False
+        (caller should fall back to SEARCH).
+        """
+        print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection')
+        t_end = time.time() + LOCK_DURATION
+        last = None
+        while time.time() < t_end and not self._stop:
+            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            if cx is not None:
+                last = (cx, cy, size)
+            self._safe_hover(z=CRUISE_ALT)
+            time.sleep(0.05)
+
+        if last is not None:
+            print(f'  [LOCK] confirmed (cx={last[0]:.0f} size={last[2]:.0f}px) → APPROACH')
+            return True
+        print('  [LOCK] lost during hover → SEARCH')
+        return False
+
     # ── state: APPROACH ──────────────────────────────────────────────────────
 
     def approach_gate(self):
@@ -744,6 +773,26 @@ class GateController:
         self._cf.param.set_value('kalman.resetEstimation', '0')
         time.sleep(2)
 
+        # ── background frame saver ─────────────────────────────────────────────
+        os.makedirs('gate_frames', exist_ok=True)
+        frame_idx    = [0]
+        last_frame   = [None]
+        save_running = [True]
+
+        def _frame_saver():
+            while save_running[0]:
+                frame = self._cam.latest_frame
+                if frame is not None and frame is not last_frame[0]:
+                    path = os.path.join('gate_frames', f'frame_{frame_idx[0]:05d}.png')
+                    cv2.imwrite(path, frame)
+                    last_frame[0]  = frame
+                    frame_idx[0]  += 1
+                time.sleep(0.05)   # ~20 fps
+
+        threading.Thread(target=_frame_saver, daemon=True, name='FrameSaver').start()
+        print(f'[FRAME SAVER] saving to gate_frames/')
+        # ──────────────────────────────────────────────────────────────────────
+
         try:
             self.takeoff(target_z=1.0)
 
@@ -754,8 +803,13 @@ class GateController:
                 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
 
-                # 1. Sweep yaw until the gate appears in frame
-                self.search_for_gate()
+                # 1. Sweep yaw until the gate appears in frame, then hover to
+                #    confirm the detection is stable before committing.
+                while not self._stop:
+                    self.search_for_gate()
+                    if self._stop or self.lock_on_gate():
+                        break
+
                 if self._stop:
                     break
 
@@ -765,7 +819,10 @@ class GateController:
                         self.transit_gate()
                         break
                     print('  gate lost — searching again')
-                    self.search_for_gate()
+                    while not self._stop:
+                        self.search_for_gate()
+                        if self._stop or self.lock_on_gate():
+                            break
 
             msg = 'All gates complete' if not self._stop else 'Emergency stop'
             print(f'\n{msg} — landing')
@@ -805,6 +862,8 @@ class GateController:
             print(f'\nUnhandled exception during mission: {e} — landing now')
 
         finally:
+            save_running[0] = False
+            print(f'[FRAME SAVER] stopped — {frame_idx[0]} frames saved to gate_frames/')
             # Always attempt a controlled landing, whatever happened above.
             # _stop_motors() is NOT called here — land() does a gradual descent
             # and only cuts motors at the end, so the drone doesn't just drop.
