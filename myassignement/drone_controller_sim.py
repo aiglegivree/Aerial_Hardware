@@ -140,8 +140,11 @@ WAYPOINT_YAW_KP    = 1.5   # heading error (deg) → yaw rate (deg/s)
 
 # One patrol waypoint per gate, evenly spaced counter-clockwise around the
 # circle. Replace with explicit (x, y) coordinates once you know your arena.
+GATE_HEIGHT = 0.4
 NO_GATE_WAYPOINTS = [
-    (0.65, -0.74, 1.28, 58), (1.78, -0.92, 1.13, 100), (2.22, 0.05, 1.42, 188), (1.52, 0.83, 1.17, 233), (0.51, 0.9, 1.28, 280)
+    (0.65, -0.74, 1.28, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.78, -0.92, 1.13, np.deg2rad(100), 0.29, GATE_HEIGHT),
+    (2.22, 0.05, 1.42, np.deg2rad(188), 0.4, GATE_HEIGHT), (1.52, 0.83, 1.17, np.deg2rad(233), 0.4, GATE_HEIGHT),
+    (0.51, 0.9, 1.28, np.deg2rad(280), 0.29, GATE_HEIGHT)
 ]
 
 
@@ -907,7 +910,7 @@ class GateController:
         prev_xy = (start_xyz[0], start_xyz[1])
 
         for g in gates:
-            gx, gy, gz, theta, _gh, gw = g
+            gx, gy, gz, theta, gw, _gh = g
 
             # Gate's plane direction, then flythrough direction (perpendicular).
             # Two candidate flythrough axes: ±(-sin θ, cos θ). Pick whichever
