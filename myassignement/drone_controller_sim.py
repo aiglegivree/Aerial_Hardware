@@ -137,7 +137,7 @@ WAYPOINT_YAW_KP    = 1.5   # heading error (deg) → yaw rate (deg/s)
 # One patrol waypoint per gate, evenly spaced counter-clockwise around the
 # circle. Replace with explicit (x, y) coordinates once you know your arena.
 NO_GATE_WAYPOINTS = [
-    (0, -0.2)
+    (0.65, -0.74, 1.28), (1.78, -0.92, 1.13), (2.22, 0.05, 1.42), (1.52, 0.83, 1.17), (0.51, 0.9, 1.28)
 ]
 
 
