@@ -120,6 +120,10 @@ SEARCH_YAW_RATE = 15.0  # deg/s CCW
 SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
 LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
 
+# After SEARCH spots a gate, hold position for this long while continuing to
+# detect, then commit to APPROACH.
+LOCK_DURATION   = 1.5   # s — hover-and-confirm window
+
 N_GATES = 5  # Part 1 vision gates to search for 
 
 # ── Part 1: patrol search path ─────────────────────────────────────────────────
@@ -607,6 +611,31 @@ class GateController:
 
             time.sleep(0.05)
 
+    # ── state: LOCK ──────────────────────────────────────────────────────────
+
+    def lock_on_gate(self):
+        """
+        After SEARCH first spots a gate, stop yawing and hover in place for
+        LOCK_DURATION seconds, polling the detector each tick. Returns True
+        if a gate is still in frame at the end of the window, else False
+        (caller should fall back to SEARCH).
+        """
+        print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection')
+        t_end = time.time() + LOCK_DURATION
+        last = None
+        while time.time() < t_end and not self._stop:
+            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            if cx is not None:
+                last = (cx, cy, size)
+            self._safe_hover(z=CRUISE_ALT)
+            time.sleep(0.05)
+
+        if last is not None:
+            print(f'  [LOCK] confirmed (cx={last[0]:.0f} size={last[2]:.0f}px) → APPROACH')
+            return True
+        print('  [LOCK] lost during hover → SEARCH')
+        return False
+
     # ── state: APPROACH ──────────────────────────────────────────────────────
 
     def approach_gate(self):
@@ -754,8 +783,13 @@ class GateController:
                 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
 
-                # 1. Sweep yaw until the gate appears in frame
-                self.search_for_gate()
+                # 1. Sweep yaw until the gate appears in frame, then hover to
+                #    confirm the detection is stable before committing.
+                while not self._stop:
+                    self.search_for_gate()
+                    if self._stop or self.lock_on_gate():
+                        break
+
                 if self._stop:
                     break
 
@@ -765,7 +799,10 @@ class GateController:
                         self.transit_gate()
                         break
                     print('  gate lost — searching again')
-                    self.search_for_gate()
+                    while not self._stop:
+                        self.search_for_gate()
+                        if self._stop or self.lock_on_gate():
+                            break
 
             msg = 'All gates complete' if not self._stop else 'Emergency stop'
             print(f'\n{msg} — landing')
