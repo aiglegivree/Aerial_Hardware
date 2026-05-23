@@ -688,7 +688,7 @@ class GateController:
             # Periodic heartbeat so we know search is alive (also reports
             # measured camera fps so we can confirm the AI-deck is healthy)
             tick += 1
-            if tick % 20 == 0:  # every ~1 s at 0.05 s loop
+            if tick % 10 == 0:  # every ~1 s at 0.1 s loop
                 fps = frames_seen / max(elapsed, 0.001)
                 print(f'  [SEARCH] tick={tick} t={elapsed:.1f}s fps={fps:.1f} '
                       f'yaw={self._state["yaw"]:+.0f}deg yaw_rate={sweep_yaw_rate:+.1f}deg/s '
@@ -910,7 +910,7 @@ class GateController:
             else:  # stale — keep coasting on last command
                 stale += 1
                 self._safe_hover(vx=TRANSIT_VX, vy=last_vy, z=target_z)
-            time.sleep(0.05)
+            time.sleep(0.1)
         print(f'  [TRANSIT] done (seen={seen} miss={miss} stale={stale} ticks, '
               f'pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f},{self._state["z"]:.2f}))')
 
@@ -959,7 +959,7 @@ class GateController:
                              -SEARCH_YAW_RATE, SEARCH_YAW_RATE)
 
             self._safe_hover(vx=bvx, vy=bvy, yaw_rate=yaw_rate, z=wz)
-            time.sleep(0.05)
+            time.sleep(0.1)
 
         return 'stopped'
 
