@@ -114,12 +114,13 @@ TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
 # IBVS gains — tune these on the real drone
-KP_VX        = 0.008  # size error  (GATE_SIZE_CLOSE - size) → forward speed
-KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
-KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
-MAX_VX       = 0.15   # m/s — forward cap (never backward)
-MAX_VY       = 0.20   # m/s — strafe cap
-MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
+# (Conservative: user said "slow is fine"; prefer reliable centering over speed.)
+KP_VX        = 0.005  # size error  (GATE_SIZE_CLOSE - size) → forward speed
+KP_VY        = 0.004  # lateral pixel error (cx - cx_mid)    → strafe speed
+KP_VZ        = 0.004  # vertical pixel error (cy_mid - cy)   → altitude delta
+MAX_VX       = 0.10   # m/s — forward cap (never backward)
+MAX_VY       = 0.15   # m/s — strafe cap
+MAX_VZ_DELTA = 0.4    # m   — altitude adjustment cap
 
 # Alignment gating for APPROACH → TRANSIT handoff
 ALIGN_TOL_X      = 25   # px — |cx - cx_mid| must be under this to allow TRANSIT
@@ -129,16 +130,26 @@ ALIGN_TOL_Y      = 25   # px — |cy_mid - cy| must be under this to allow TRANS
 # the drone strafes/climbs in place until the gate is roughly centred.
 ALIGN_SCALE_DENOM = 0.6  # fraction of half-frame at which vx → 0
 
-TRANSIT_VX   = 0.30   # m/s — slower than before; still open-loop forward push
-TRANSIT_TIME = 1.5    # s
+TRANSIT_VX   = 0.20   # m/s — slower than before; still open-loop forward push
+TRANSIT_TIME = 1.8    # s
 
-SEARCH_YAW_RATE = 15.0  # deg/s CCW
+SEARCH_YAW_RATE = 12.0  # deg/s CCW
 SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
-LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
 
 # After SEARCH spots a gate, hold position for this long while continuing to
-# detect, then commit to APPROACH.
-LOCK_DURATION   = 1.5   # s — hover-and-confirm window
+# detect, then commit to APPROACH. Lock requires LOCK_MIN_HITS consecutive
+# detections on UNIQUE frames to filter out single-frame flukes. Tuned for
+# the AI-deck's real ~2–3 fps: 2 confirmed fresh detections in ~2.5 s.
+LOCK_DURATION   = 2.5   # s — hover-and-confirm window
+LOCK_MIN_HITS   = 2     # consecutive UNIQUE-FRAME detections required
+
+# Lost-detection timeout is wall-clock based (not tick-based) so a slow
+# camera doesn't make us bail prematurely. With ~3 fps, 1.5 s = ~4–5 frames.
+LOST_TIMEOUT_S  = 1.5   # s — APPROACH gives up after this long without a fresh hit
+
+# Exponential moving average on detections — smooths out single-frame noise.
+# alpha = weight given to the newest sample. 1.0 = no smoothing.
+DETECT_EMA_ALPHA = 0.5
 
 N_GATES = 5  # Part 1 vision gates to search for
 
@@ -528,6 +539,14 @@ class GateController:
         self._stop        = False
         self._state       = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0}
 
+        # Fresh-vs-stale detection bookkeeping. The AI-deck only delivers
+        # ~2–3 fps with notable latency, so the 20 Hz control loop must
+        # distinguish a NEW frame from a repeat of the last one.
+        self._last_frame_obj    = None  # identity of last processed frame
+        self._ema_cx            = None  # smoothed detection
+        self._ema_cy            = None
+        self._ema_size          = None
+
         # Log config is set up after connection (called from main)
         lg = LogConfig(name='State', period_in_ms=100)
         lg.add_variable('stateEstimate.x', 'float')
@@ -541,6 +560,47 @@ class GateController:
             self.is_connected = True
         except Exception as e:
             print(f'Log setup failed: {e}')
+
+    # ── detection polling (fresh vs stale frame) ──────────────────────────────
+    #
+    # The camera UDP stream tops out at ~2–3 fps. At a 20 Hz control loop, the
+    # SAME frame would be processed 7–10× in a row — every "stale" hit looking
+    # like a new detection. _poll_detection returns one of three statuses so
+    # callers can react ONLY on fresh information.
+
+    def _poll_detection(self):
+        """
+        Returns (cx, cy, size, status) where status ∈
+          'new_hit'  — fresh frame, gate detected (cx,cy,size are EMA-smoothed)
+          'new_miss' — fresh frame, no gate detected
+          'stale'    — same frame object as last poll (no fresh info available)
+        """
+        frame = self._cam.latest_frame if self._cam is not None else None
+        if frame is None or frame is self._last_frame_obj:
+            return None, None, None, 'stale'
+        self._last_frame_obj = frame
+
+        cx, cy, size = get_gate_detection(frame)
+        if cx is None:
+            return None, None, None, 'new_miss'
+
+        # EMA smoothing — damp single-frame outliers (one wild detection out
+        # of every 3 frames is a 33% noise pulse without smoothing).
+        a = DETECT_EMA_ALPHA
+        if self._ema_cx is None:
+            self._ema_cx, self._ema_cy, self._ema_size = cx, cy, size
+        else:
+            self._ema_cx   = a * cx   + (1 - a) * self._ema_cx
+            self._ema_cy   = a * cy   + (1 - a) * self._ema_cy
+            self._ema_size = a * size + (1 - a) * self._ema_size
+        return self._ema_cx, self._ema_cy, self._ema_size, 'new_hit'
+
+    def _reset_detection_filter(self):
+        """Clear EMA state — call when entering a new visual-servo phase
+        so we don't carry pixel state across gates / search → approach."""
+        self._ema_cx = None
+        self._ema_cy = None
+        self._ema_size = None
 
     def _log_cb(self, timestamp, data, logconf):
         self._state['x']   = data['stateEstimate.x']
@@ -618,13 +678,20 @@ class GateController:
         Oscillates the yaw back and forth to scan the immediate area.
         """
         print('  [SEARCH] Sweeping...')
+        self._reset_detection_filter()
         t_start = time.time()
+        tick = 0
+        frames_seen = 0
 
         while not self._stop:
-            # 1. Check the camera
-            cx, cy, size = get_gate_detection(self._cam.latest_frame)
-            if cx is not None:
-                print(f'  [SEARCH] gate found  cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px')
+            # 1. Check the camera — react only to FRESH frames
+            cx, cy, size, status = self._poll_detection()
+            if status != 'stale':
+                frames_seen += 1
+            if status == 'new_hit':
+                print(f'  [SEARCH] gate found  cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px '
+                      f'after {time.time() - t_start:.1f}s, yaw={self._state["yaw"]:+.0f}deg '
+                      f'(frames_seen={frames_seen})')
                 return
 
             # 2. Execute flight pattern
@@ -634,31 +701,66 @@ class GateController:
             sweep_yaw_rate = math.sin(elapsed * math.pi / 5) * SEARCH_YAW_RATE
             self._safe_hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
 
+            # Periodic heartbeat so we know search is alive (also reports
+            # measured camera fps so we can confirm the AI-deck is healthy)
+            tick += 1
+            if tick % 20 == 0:  # every ~1 s at 0.05 s loop
+                fps = frames_seen / max(elapsed, 0.001)
+                print(f'  [SEARCH] tick={tick} t={elapsed:.1f}s fps={fps:.1f} '
+                      f'yaw={self._state["yaw"]:+.0f}deg yaw_rate={sweep_yaw_rate:+.1f}deg/s '
+                      f'pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f},{self._state["z"]:.2f})')
+
             time.sleep(0.05)
 
     # ── state: LOCK ──────────────────────────────────────────────────────────
 
     def lock_on_gate(self):
-        """q
-        After SEARCH first spots a gate, stop yawing and hover in place for
-        LOCK_DURATION seconds, polling the detector each tick. Returns True
-        if a gate is still in frame at the end of the window, else False
-        (caller should fall back to SEARCH).
         """
-        print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection')
+        After SEARCH first spots a gate, stop yawing and hover in place for
+        LOCK_DURATION seconds, polling the detector each tick. Confirmation
+        requires LOCK_MIN_HITS consecutive detections (filters single-frame
+        flukes). Returns True if confirmed, else False (caller falls back to
+        SEARCH).
+        """
+        print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection '
+              f'(need {LOCK_MIN_HITS} consecutive UNIQUE-FRAME hits)')
+        # Don't reset EMA here — keep refining the smoothed pose from search.
         t_end = time.time() + LOCK_DURATION
+        hits = 0
+        misses = 0
+        stale = 0
+        best_streak = 0
         last = None
+        tick = 0
         while time.time() < t_end and not self._stop:
-            cx, cy, size = get_gate_detection(self._cam.latest_frame)
-            if cx is not None:
+            cx, cy, size, status = self._poll_detection()
+            tick += 1
+            if status == 'new_hit':
+                hits += 1
+                best_streak = max(best_streak, hits)
                 last = (cx, cy, size)
+                print(f'  [LOCK] tick={tick:3d} HIT   cx={cx:6.1f} cy={cy:6.1f} '
+                      f'size={size:5.1f}px streak={hits}')
+            elif status == 'new_miss':
+                if hits > 0:
+                    print(f'  [LOCK] tick={tick:3d} MISS  (streak broken at {hits})')
+                else:
+                    print(f'  [LOCK] tick={tick:3d} MISS')
+                misses += 1
+                hits = 0
+            else:
+                stale += 1
             self._safe_hover(z=CRUISE_ALT)
-            time.sleep(0.05)
+            time.sleep(0.1)
 
-        if last is not None:
-            print(f'  [LOCK] confirmed (cx={last[0]:.0f} size={last[2]:.0f}px) → APPROACH')
+        unique = (best_streak if best_streak > hits else hits) + misses
+        if best_streak >= LOCK_MIN_HITS and last is not None:
+            print(f'  [LOCK] CONFIRMED  best_streak={best_streak} '
+                  f'unique_frames={unique} stale_ticks={stale} '
+                  f'last(cx={last[0]:.0f},size={last[2]:.0f}px) → APPROACH')
             return True
-        print('  [LOCK] lost during hover → SEARCH')
+        print(f'  [LOCK] FAILED  best_streak={best_streak} (<{LOCK_MIN_HITS}) '
+              f'unique_frames={unique} stale_ticks={stale} → SEARCH')
         return False
 
     # ── state: APPROACH ──────────────────────────────────────────────────────
@@ -679,25 +781,56 @@ class GateController:
         Returns False when gate lost > LOST_TOLERANCE (→ SEARCH).
         """
         print('  [APPROACH] IBVS toward gate')
+        # Keep EMA from lock (already converged to the gate); just record start.
         cx_mid   = CAM_WIDTH  / 2.0   # 162 px
         cy_mid   = CAM_HEIGHT / 2.0   # 122 px
         target_z = CRUISE_ALT
-        lost     = 0
+        tick     = 0
+        t_start  = time.time()
+        t_last_hit = time.time()  # wall-clock timestamp of last fresh hit
+        frames_seen = 0
+
+        # Last commanded velocities — re-sent on stale ticks so the drone keeps
+        # progressing between sparse camera frames instead of stuttering. They
+        # are ONLY refreshed on a 'new_hit' tick (true closed-loop update).
+        last_vx = 0.0
+        last_vy = 0.0
 
         while not self._stop:
-            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            cx, cy, size, status = self._poll_detection()
+            tick += 1
 
-            if cx is None:
-                lost += 1
-                if lost > LOST_TOLERANCE:
-                    print('  [APPROACH] gate lost — back to SEARCH')
+            # ── Stale tick: re-send last command, do NOT recompute from old pixels.
+            if status == 'stale':
+                age = time.time() - t_last_hit
+                if age > LOST_TIMEOUT_S:
+                    print(f'  [APPROACH] LOST {age:.2f}s with no fresh frame → SEARCH '
+                          f'(approach lasted {time.time() - t_start:.1f}s, '
+                          f'fresh_frames={frames_seen})')
                     return False
-                # Hold last commanded altitude while waiting for gate to reappear
-                self._safe_hover(z=target_z)
+                self._safe_hover(vx=last_vx, vy=last_vy, z=target_z)
                 time.sleep(0.05)
                 continue
 
-            lost = 0
+            # ── Fresh frame received (hit or miss).
+            frames_seen += 1
+
+            if status == 'new_miss':
+                age = time.time() - t_last_hit
+                print(f'  [APPROACH] tick={tick:4d} fresh MISS (age={age:.2f}s) '
+                      f'coast vx={last_vx:.2f} vy={last_vy:+.2f} z={target_z:.2f}')
+                if age > LOST_TIMEOUT_S:
+                    print(f'  [APPROACH] gate lost {age:.2f}s → SEARCH '
+                          f'(approach lasted {time.time() - t_start:.1f}s, '
+                          f'fresh_frames={frames_seen})')
+                    return False
+                # Coast on the last good command but never accelerate from stale data
+                self._safe_hover(vx=last_vx, vy=last_vy, z=target_z)
+                time.sleep(0.05)
+                continue
+
+            # status == 'new_hit'
+            t_last_hit = time.time()
 
             # ── Step 1: pixel errors ────────────────────────────────────────
             e_x = -cx + cx_mid          # +ve → gate left of centre (strafe left)
@@ -705,9 +838,12 @@ class GateController:
             e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small → move forward
 
             # ── Step 2: check termination — only TRANSIT if also aligned ────
-            if size >= GATE_SIZE_CLOSE and abs(e_x) < ALIGN_TOL_X and abs(e_y) < ALIGN_TOL_Y:
-                print(f'  [APPROACH] gate fills frame & aligned (size={size:.0f}px '
-                      f'ex={e_x:+.0f} ey={e_y:+.0f}) → TRANSIT')
+            size_ok  = size >= GATE_SIZE_CLOSE
+            align_ok = abs(e_x) < ALIGN_TOL_X and abs(e_y) < ALIGN_TOL_Y
+            if size_ok and align_ok:
+                print(f'  [APPROACH] DONE  size={size:.0f}px>={GATE_SIZE_CLOSE} '
+                      f'ex={e_x:+.0f}<{ALIGN_TOL_X} ey={e_y:+.0f}<{ALIGN_TOL_Y} '
+                      f'after {time.time() - t_start:.1f}s → TRANSIT')
                 return True
 
             # ── Step 3: proportional control ────────────────────────────────
@@ -733,11 +869,18 @@ class GateController:
                               CRUISE_ALT - MAX_VZ_DELTA,
                               CRUISE_ALT + MAX_VZ_DELTA)
 
-            print(f'  [IBVS] ex={e_x:+.0f}px ey={e_y:+.0f}px size={size:.0f}px'
-                  f'  align={align_factor:.2f}'
-                  f'  → vx={v_forward:.2f} vy={v_strafe:+.2f} z={target_z:.2f}')
+            sx = 'OK' if size_ok else '--'
+            ax = 'OK' if align_ok else '--'
+            fps = frames_seen / max(time.time() - t_start, 0.001)
+            print(f'  [IBVS] t={tick:4d} f={frames_seen} fps={fps:.1f}  '
+                  f'cx={cx:6.1f} cy={cy:6.1f} sz={size:5.1f}px '
+                  f'[{sx}|{ax}]  ex={e_x:+5.0f} ey={e_y:+5.0f} ez={e_z:+5.0f}  '
+                  f'align={align_factor:.2f}  vx={v_forward:.3f} vy={v_strafe:+.3f} '
+                  f'z={target_z:.2f}  pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f})')
 
-            # ── Step 5: send command ─────────────────────────────────────────
+            # ── Step 5: cache + send command ─────────────────────────────────
+            # Cache for stale-tick re-send (no fresh frame → coast on last cmd)
+            last_vx, last_vy = v_forward, v_strafe
             self._safe_hover(vx=v_forward, vy=v_strafe, z=target_z)
             time.sleep(0.05)
 
@@ -752,14 +895,21 @@ class GateController:
         and vertical pixel error so a late drift doesn't clip the frame. Once
         the gate disappears from view, finish the push open-loop.
         """
-        print('  [TRANSIT] flying through gate')
+        print(f'  [TRANSIT] flying through gate (vx={TRANSIT_VX} m/s for {TRANSIT_TIME}s)')
         cx_mid = CAM_WIDTH  / 2.0
         cy_mid = CAM_HEIGHT / 2.0
         target_z = CRUISE_ALT
         t_end = time.time() + TRANSIT_TIME
+        tick = 0
+        seen = 0
+        miss = 0
+        stale = 0
+        last_vy = 0.0
         while time.time() < t_end and not self._stop:
-            cx, cy, _size = get_gate_detection(self._cam.latest_frame)
-            if cx is not None:
+            cx, cy, _size, status = self._poll_detection()
+            tick += 1
+            if status == 'new_hit':
+                seen += 1
                 e_x = -cx + cx_mid
                 e_y = cy_mid - cy
                 v_strafe = clamp(KP_VY * e_x, -MAX_VY, MAX_VY)
@@ -767,12 +917,20 @@ class GateController:
                 target_z = clamp(CRUISE_ALT + v_climb,
                                  CRUISE_ALT - MAX_VZ_DELTA,
                                  CRUISE_ALT + MAX_VZ_DELTA)
+                last_vy = v_strafe
+                print(f'  [TRANSIT] t={tick:3d} SEEN  cx={cx:6.1f} cy={cy:6.1f} '
+                      f'ex={e_x:+5.0f} ey={e_y:+5.0f} vy={v_strafe:+.3f} z={target_z:.2f}')
                 self._safe_hover(vx=TRANSIT_VX, vy=v_strafe, z=target_z)
-            else:
-                # Gate no longer visible → we are past the plane, finish straight
+            elif status == 'new_miss':
+                miss += 1
+                # Gate no longer visible → past the plane, drive straight forward
                 self._safe_hover(vx=TRANSIT_VX, z=target_z)
+            else:  # stale — keep coasting on last command
+                stale += 1
+                self._safe_hover(vx=TRANSIT_VX, vy=last_vy, z=target_z)
             time.sleep(0.05)
-        print('  [TRANSIT] done')
+        print(f'  [TRANSIT] done (seen={seen} miss={miss} stale={stale} ticks, '
+              f'pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f},{self._state["z"]:.2f}))')
 
     # ── mission: Part 1 — vision ─────────────────────────────────────────────
 
@@ -858,6 +1016,7 @@ class GateController:
                     break
 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
+                self._reset_detection_filter()  # fresh EMA per gate
 
                 # 1. Sweep yaw until the gate appears in frame, then hover to
                 #    confirm the detection is stable before committing.
