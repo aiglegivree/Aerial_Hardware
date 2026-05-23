@@ -74,7 +74,7 @@ MISSION = 'vision'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoin
 
 # ── connection ─────────────────────────────────────────────────────────────────
 
-CONTROL_URI = uri_helper.uri_from_env(default='radio://0/20/2M/E7E7E7E708')
+CONTROL_URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E708')
 
 UDP_AIDECK_IP   = '192.168.4.1'
 UDP_AIDECK_PORT = 5000
