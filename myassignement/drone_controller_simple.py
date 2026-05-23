@@ -310,10 +310,11 @@ class UdpVideoThread(threading.Thread):
 
 class FpvViewerThread(threading.Thread):
     """
-    Live FPV window. Polls the camera's latest frame, runs the gate detector
-    for an overlay (center crosshair + size + bounding info), and displays
-    via cv2.imshow. Press 'q' inside the window to close it (mission keeps
-    running; emergency stop is handled by the pynput listener).
+    Live FPV window. Polls the camera's latest frame, reads the controller's
+    LAST detection (does NOT re-run the detector — that work happens once per
+    frame in the control loop), and overlays a marker. Press capital 'Q'
+    inside the window to close it (mission keeps running; lowercase 'q' is
+    the emergency stop, handled by the pynput listener).
     """
 
     def __init__(self, cam: 'UdpVideoThread', ctrl=None):
@@ -328,53 +329,6 @@ class FpvViewerThread(threading.Thread):
 
     def stop(self):
         self._running = False
-
-    @staticmethod
-    def _detect_overlay(frame):
-        """
-        Re-runs the gate-detection pipeline (independently from the control
-        path) and returns drawable data: the winning rotated rect plus a list
-        of rejected contour rects, so the FPV view can visualize the detector.
-        """
-        bgr = frame if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, GATE_HSV_LOWER, GATE_HSV_UPPER)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((20, 5), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 20), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
-        mask = _fill_holes(mask)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        best_score = 0.0
-        best_rect = None
-        rejected = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 250:
-                continue
-            rect = cv2.minAreaRect(cnt)
-            (_, _), (rw, rh), _ = rect
-            if rw < 10 or rh < 10:
-                continue
-            short_side, long_side = sorted([rw, rh])
-            aspect = short_side / long_side
-            rotated_area = rw * rh
-            rectangularity = area / rotated_area
-            hull_area = cv2.contourArea(cv2.convexHull(cnt))
-            solidity = area / hull_area if hull_area > 0 else 0.0
-            if aspect < 0.45 or rectangularity < 0.80 or solidity < 0.85:
-                rejected.append(rect)
-                continue
-            score = rectangularity * solidity * np.log1p(area)
-            if score > best_score:
-                if best_rect is not None:
-                    rejected.append(best_rect)
-                best_score = score
-                best_rect = rect
-            else:
-                rejected.append(rect)
-        return mask, best_rect, rejected
 
     def run(self):
         win = 'Crazyflie FPV'
@@ -399,26 +353,24 @@ class FpvViewerThread(threading.Thread):
                 cv2.waitKey(1)
                 continue
             last = frame
-            disp = frame.copy()
+            disp = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-            # Detection overlay (re-run independently of control)
-            _mask, best_rect, rejected = self._detect_overlay(frame)
+            # Crosshair
             cv2.line(disp, (CAM_WIDTH // 2, 0), (CAM_WIDTH // 2, CAM_HEIGHT),
                      (60, 60, 60), 1)
             cv2.line(disp, (0, CAM_HEIGHT // 2), (CAM_WIDTH, CAM_HEIGHT // 2),
                      (60, 60, 60), 1)
 
-            # Rejected candidates in faint red
-            for rect in rejected:
-                box = cv2.boxPoints(rect).astype(np.int32)
-                cv2.drawContours(disp, [box], 0, (0, 0, 180), 1)
-
-            if best_rect is not None:
-                (rcx, rcy), (rw, rh), _ = best_rect
-                size = max(rw, rh)
+            # Read the controller's cached detection — no CV work here.
+            det = self._ctrl.last_detection if self._ctrl is not None else None
+            if det is not None:
+                rcx, rcy, size = det
                 color = (0, 255, 0) if size >= GATE_SIZE_CLOSE else (0, 200, 255)
-                box = cv2.boxPoints(best_rect).astype(np.int32)
-                cv2.drawContours(disp, [box], 0, color, 2)
+                half = int(size / 2)
+                cv2.rectangle(disp,
+                              (int(rcx) - half, int(rcy) - half),
+                              (int(rcx) + half, int(rcy) + half),
+                              color, 2)
                 cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
                                cv2.MARKER_CROSS, 14, 2)
                 cv2.putText(disp,
@@ -567,6 +519,14 @@ class GateController:
         self._ema_cy            = None
         self._ema_size          = None
 
+        # Shared with FpvViewerThread so it can draw the overlay without
+        # re-running the detection pipeline (cuts CV load roughly in half and
+        # stops the UDP recv thread from being GIL-starved mid-flight).
+        # 'hit'  → (cx, cy, size) of the last successful detection
+        # 'miss' → True when the most recent fresh frame had no gate
+        self.last_detection = None
+        self.last_detection_miss = False
+
         # Log config is set up after connection (called from main)
         lg = LogConfig(name='State', period_in_ms=100)
         lg.add_variable('stateEstimate.x', 'float')
@@ -602,6 +562,8 @@ class GateController:
 
         cx, cy, size = get_gate_detection(frame)
         if cx is None:
+            self.last_detection = None
+            self.last_detection_miss = True
             return None, None, None, 'new_miss'
 
         # EMA smoothing — damp single-frame outliers (one wild detection out
@@ -613,6 +575,8 @@ class GateController:
             self._ema_cx   = a * cx   + (1 - a) * self._ema_cx
             self._ema_cy   = a * cy   + (1 - a) * self._ema_cy
             self._ema_size = a * size + (1 - a) * self._ema_size
+        self.last_detection = (self._ema_cx, self._ema_cy, self._ema_size)
+        self.last_detection_miss = False
         return self._ema_cx, self._ema_cy, self._ema_size, 'new_hit'
 
     def _reset_detection_filter(self):
@@ -730,7 +694,7 @@ class GateController:
                       f'yaw={self._state["yaw"]:+.0f}deg yaw_rate={sweep_yaw_rate:+.1f}deg/s '
                       f'pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f},{self._state["z"]:.2f})')
 
-            time.sleep(0.05)
+            time.sleep(0.1)
 
     # ── state: LOCK ──────────────────────────────────────────────────────────
 
@@ -827,7 +791,7 @@ class GateController:
                           f'fresh_frames={frames_seen})')
                     return False
                 self._safe_hover(vx=last_vx, vy=last_vy, z=target_z)
-                time.sleep(0.05)
+                time.sleep(0.1)
                 continue
 
             # ── Fresh frame received (hit or miss).
@@ -844,7 +808,7 @@ class GateController:
                     return False
                 # Coast on the last good command but never accelerate from stale data
                 self._safe_hover(vx=last_vx, vy=last_vy, z=target_z)
-                time.sleep(0.05)
+                time.sleep(0.1)
                 continue
 
             # status == 'new_hit'
@@ -900,7 +864,7 @@ class GateController:
             # Cache for stale-tick re-send (no fresh frame → coast on last cmd)
             last_vx, last_vy = v_forward, v_strafe
             self._safe_hover(vx=v_forward, vy=v_strafe, z=target_z)
-            time.sleep(0.05)
+            time.sleep(0.1)
 
         return False
 
