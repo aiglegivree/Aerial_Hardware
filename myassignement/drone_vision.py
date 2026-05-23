@@ -311,8 +311,8 @@ class UdpVideoThread(threading.Thread):
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
-            return None
+        # if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
+        #     return None
         if img.ndim == 2:
             return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return img
@@ -716,6 +716,7 @@ if __name__ == '__main__':
     cam.start()
     print('Waiting for first camera frame...')
     while cam.latest_frame is None:
+    
         time.sleep(0.05)
     print('Camera ready')
 
