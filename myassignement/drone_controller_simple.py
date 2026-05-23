@@ -213,14 +213,10 @@ class UdpVideoThread(threading.Thread):
         super().__init__(daemon=True, name='UdpVideoThread')
         self._lock = threading.Lock()
         self._frame = None
-        self._running = False
-
-    def start(self):
-        self._running = True
-        super().start()
 
     def stop(self):
-        self._running = False
+        # Kept for API compatibility; the daemon thread exits with the process.
+        pass
 
     @property
     def latest_frame(self):
@@ -237,12 +233,8 @@ class UdpVideoThread(threading.Thread):
         expected_size = 0
         receiving = False
 
-        while self._running:
-            try:
-                data, _ = sock.recvfrom(2048)
-            except Exception:
-                time.sleep(0.01)
-                continue
+        while True:
+            data, _ = sock.recvfrom(2048)
             if len(data) < CPX_HEADER_SIZE:
                 continue
             payload = data[CPX_HEADER_SIZE:]
@@ -262,28 +254,26 @@ class UdpVideoThread(threading.Thread):
             buffer.extend(payload)
 
             if len(buffer) >= expected_size:
-                frame = self._decode_frame(buffer)
-                if frame is not None:
-                    with self._lock:
-                        self._frame = frame
+                self._decode_and_store(buffer)
                 receiving = False
 
-    def _decode_frame(self, buffer):
+    def _decode_and_store(self, buffer):
         soi = buffer.find(b'\xff\xd8')
         eoi = buffer.rfind(b'\xff\xd9')
         if soi < 0 or eoi <= soi:
-            return None
+            return
         jpeg_len = eoi + 2 - soi
         if jpeg_len < MIN_JPEG_BYTES:
-            return None
+            return
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
         if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
-            return None
-        if img.ndim == 2:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        return img
+            return
+        # No colour-channel swap: get_gate_detection expects BGR (or gray).
+        # The FPV example swaps BGR→RGB only for Qt display, which we don't need.
+        with self._lock:
+            self._frame = img
 
 
 # ── FPV viewer thread ─────────────────────────────────────────────────────────
