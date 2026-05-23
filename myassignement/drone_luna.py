@@ -29,12 +29,12 @@ Part 1 — visual servoing (no world-frame gate position needed):
   vertical error cy_mid - cy            → Δz   (altitude nudge)
   size gap       GATE_SIZE_CLOSE - size → vx   (forward speed)
 
-Part 2 — raw waypoint streaming (Lighthouse world frame):
-  Build one waypoint list per lap (start → pre-gate, gate centre, post-gate
-  ×N → return). Stream each waypoint via send_position_setpoint and advance
-  to the next once the drone is within WAYPOINT_REACH_TOL. The Crazyflie's
-  onboard position controller smooths the motion between waypoints; no
-  polynomial trajectory fit needed.
+Part 2 — minimum-jerk trajectory (Lighthouse world frame):
+  Mirrors the simulation's handle_fast_lap: build one waypoint list
+  (start → pre-gate, gate centre, post-gate ×N → return), fit a single
+  minimum-jerk polynomial trajectory through it, then follow it open-loop
+  by streaming the time-indexed send_position_setpoints. Boundary safety
+  clamps any waypoint whose radius exceeds 2 m.
 
 Boundary safety:
   stateEstimate.x/y from Lighthouse → enforce 2 m radius hard limit.
@@ -47,9 +47,7 @@ Press 'q' at any time for emergency stop.
 import contextlib
 import logging
 import math
-import multiprocessing as mp
 import os
-import queue as queue_mod
 import socket
 import struct
 import time
@@ -89,26 +87,17 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
 # ── FPV viewer ────────────────────────────────────────────────────────────────
-# The viewer now runs in a SEPARATE PROCESS (mp.Process). It receives frames
-# over a maxsize=1 queue — when the queue is full we drop, so the control
-# loop never waits on the GUI. Because the viewer has its own GIL/interpreter,
-# its render rate is no longer coupled to the recv thread; the rate is driven
-# by the camera's natural fps (~3 fps).
-FPV_ENABLED  = True   # show live camera window with detection overlay
+FPV_ENABLED  = False  # show live camera window with detection overlay
 FPV_SCALE    = 2      # upscale factor for the display window
+FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
+                       # (kept low so the UDP receiver thread isn't GIL-starved
+                       #  — that was causing the AI-deck stream to stall after
+                       #  the first frame)
 
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
-MIN_JPEG_BYTES   = 1000
-
-# ── arena bounds (Lighthouse world frame) ──────────────────────────────────────
-ARENA_X_MIN = -1.0   # m — back wall
-ARENA_X_MAX = +3.0   # m — front wall
-ARENA_Y_MIN = -0.9   # m — right wall
-ARENA_Y_MAX = +0.9   # m — left wall
-
-SAFETY_MARGIN_HARD = 0.00000  # m — never fly closer than this to a wall
+MIN_JPEG_BYTES   = 5000
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
@@ -117,42 +106,24 @@ TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
 # IBVS gains — tune these on the real drone
-# (Conservative: user said "slow is fine"; prefer reliable centering over speed.)
-KP_VX        = 0.005  # size error  (GATE_SIZE_CLOSE - size) → forward speed
-KP_VY        = 0.004  # lateral pixel error (cx - cx_mid)    → strafe speed
-KP_VZ        = 0.004  # vertical pixel error (cy_mid - cy)   → altitude delta
-MAX_VX       = 0.10   # m/s — forward cap (never backward)
-MAX_VY       = 0.15   # m/s — strafe cap
-MAX_VZ_DELTA = 0.4    # m   — altitude adjustment cap
+KP_VX        = 0.010  # size error  (GATE_SIZE_CLOSE - size) → forward speed
+KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
+KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
+MAX_VX       = 0.10    # m/s — forward cap (never backward)
+MAX_VY       = 0.10   # m/s — strafe cap
+MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
-# Alignment gating for APPROACH → TRANSIT handoff
-ALIGN_TOL_X      = 25   # px — |cx - cx_mid| must be under this to allow TRANSIT
-ALIGN_TOL_Y      = 25   # px — |cy_mid - cy| must be under this to allow TRANSIT
-# Forward speed is scaled by how well-aligned the gate is in the frame. When
-# pixel error fills this fraction of the frame, vx is throttled to zero —
-# the drone strafes/climbs in place until the gate is roughly centred.
-ALIGN_SCALE_DENOM = 0.6  # fraction of half-frame at which vx → 0
+TRANSIT_VX   = 0.5    # m/s
+TRANSIT_TIME = 2.0    # s
 
-TRANSIT_VX   = 0.20   # m/s — slower than before; still open-loop forward push
-TRANSIT_TIME = 1.8    # s
-
-SEARCH_YAW_RATE = 12.0  # deg/s CCW
-SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
+SEARCH_YAW_RATE   = 15.0  # deg/s — yaw cap used by patrol waypointing
+SEARCH_SWEEP_RATE = 7.0   # deg/s — peak yaw rate during yaw sweep
+SEARCH_SWEEP_PERIOD = 10.0  # s   — full oscillation period (gives ±45° at 7 deg/s)
+LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
 
 # After SEARCH spots a gate, hold position for this long while continuing to
-# detect, then commit to APPROACH. Lock requires LOCK_MIN_HITS consecutive
-# detections on UNIQUE frames to filter out single-frame flukes. Tuned for
-# the AI-deck's real ~2–3 fps: 2 confirmed fresh detections in ~2.5 s.
-LOCK_DURATION   = 1.0   # s — hover-and-confirm window
-LOCK_MIN_HITS   = 1     # unique-frame detections required (non-consecutive)
-
-# Lost-detection timeout is wall-clock based (not tick-based) so a slow
-# camera doesn't make us bail prematurely. With ~3 fps, 1.5 s = ~4–5 frames.
-LOST_TIMEOUT_S  = 1.5   # s — APPROACH gives up after this long without a fresh hit
-
-# Exponential moving average on detections — smooths out single-frame noise.
-# alpha = weight given to the newest sample. 1.0 = no smoothing.
-DETECT_EMA_ALPHA = 0.5
+# detect, then commit to APPROACH.
+LOCK_DURATION   = 1.5   # s — hover-and-confirm window
 
 N_GATES = 5  # Part 1 vision gates to search for
 
@@ -171,8 +142,6 @@ WAYPOINT_YAW_KP    = 1.5   # heading error (deg) → yaw rate (deg/s)
 # One patrol waypoint per gate, evenly spaced counter-clockwise around the
 # circle. Replace with explicit (x, y) coordinates once you know your arena.
 GATE_HEIGHT = 0.4
-NO_GATE_WAYPOINTS = []
-
 
 # ── Part 2: position-based mission ─────────────────────────────────────────────
 #
@@ -185,11 +154,17 @@ GATE_POSITIONS = [    (0.65, -0.74, 1.28, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.
 N_LAPS           = 2     # number of timed laps
 PRE_GATE_OFFSET  = 0.2   # m — waypoint placed before the gate along its approach axis
 POST_GATE_OFFSET = 0.2   # m — waypoint placed after the gate (clears the frame)
+LAP_DURATION_S   = 30.0  # s — total minimum-jerk trajectory time per lap.
 
-POSITION_RATE_HZ   = 20.0  # setpoint streaming rate
-WAYPOINT_REACH_TOL = 0.15  # m — final-waypoint reached tolerance
-PURSUIT_LOOKAHEAD  = 0.35  # m — carrot distance ahead of drone along the path
-                            #     larger = smoother + faster, smaller = tighter tracking
+TRAJ_VEL_LIM     = 5.0  # m/s — planner velocity ceiling (high: real speed set by LAP_DURATION_S)
+TRAJ_ACC_LIM     = 5.0  # m/s² — planner acceleration ceiling
+TRAJ_DISC_STEPS  = 20    # trajectory setpoints generated per segment
+POSITION_RATE_HZ = 20.0  # trajectory setpoint streaming rate
+WAYPOINT_REACH_TOL = 0.15  # m — advance to next trajectory setpoint when within this
+GATE_INWARD_BIAS = 0.0   # m — shift pre/post waypoints toward arena origin
+                         #     to tighten the racing line. Start at 0, try
+                         #     0.1–0.3 once basic laps work. Capped at
+                         #     half the gate width minus a safety margin.
 
 
 # ── camera thread ──────────────────────────────────────────────────────────────
@@ -216,10 +191,14 @@ class UdpVideoThread(threading.Thread):
         super().__init__(daemon=True, name='UdpVideoThread')
         self._lock = threading.Lock()
         self._frame = None
+        self._running = False
+
+    def start(self):
+        self._running = True
+        super().start()
 
     def stop(self):
-        # Kept for API compatibility; the daemon thread exits with the process.
-        pass
+        self._running = False
 
     @property
     def latest_frame(self):
@@ -227,35 +206,34 @@ class UdpVideoThread(threading.Thread):
             return self._frame
 
     def run(self):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-            sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
-            sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
-            print(f'[UDP] bound :{UDP_LOCAL_PORT}, sent START to {UDP_AIDECK_IP}:{UDP_AIDECK_PORT}')
-        except Exception as e:
-            print(f'[UDP] socket setup failed: {e!r}')
-            return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
+
+        # CRITICAL FIX 1: Add a timeout so the thread never freezes
+        sock.settimeout(0.5)
+
+        sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
 
         buffer = bytearray()
         expected_size = 0
         receiving = False
-        pkt_count = 0
-        last_log = time.time()
 
-        while True:
-            data, _ = sock.recvfrom(2048)
-            pkt_count += 1
-            if pkt_count == 1:
-                print(f'[UDP] first packet received ({len(data)} bytes)')
-            now = time.time()
-            if now - last_log > 2.0:
-                print(f'[UDP] {pkt_count} packets received in last {now - last_log:.1f}s '
-                      f'(receiving={receiving}, buf={len(buffer)}/{expected_size})')
-                last_log = now
-                pkt_count = 0
+        while self._running:
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                # CRITICAL FIX 2: Re-ping the drone if the stream stops arriving
+                sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
+                continue
+
+            except Exception:
+                time.sleep(0.01)
+                continue
+
             if len(data) < CPX_HEADER_SIZE:
                 continue
+
             payload = data[CPX_HEADER_SIZE:]
 
             if len(payload) >= IMG_HEADER_SIZE and payload[0] == IMG_HEADER_MAGIC:
@@ -273,98 +251,172 @@ class UdpVideoThread(threading.Thread):
             buffer.extend(payload)
 
             if len(buffer) >= expected_size:
-                self._decode_and_store(buffer)
+                frame = self._decode_frame(buffer) ### send the stitched-together JPEG bytes to OpenCV to convert them into a BGR pixel array.
+                if frame is not None:
+                    with self._lock:
+                        self._frame = frame
                 receiving = False
 
-    def _decode_and_store(self, buffer):
+    def _decode_frame(self, buffer):
         soi = buffer.find(b'\xff\xd8')
         eoi = buffer.rfind(b'\xff\xd9')
         if soi < 0 or eoi <= soi:
-            return
+            return None
         jpeg_len = eoi + 2 - soi
         if jpeg_len < MIN_JPEG_BYTES:
-            return
+            return None
+        
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None:# or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
-            return
-        # No colour-channel swap: get_gate_detection expects BGR (or gray).
-        # The FPV example swaps BGR→RGB only for Qt display, which we don't need.
-        with self._lock:
-            self._frame = img
+        
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        
+        return img
 
 
-# ── FPV viewer (separate process) ────────────────────────────────────────────
-#
-# Runs in its OWN OS process via multiprocessing.Process so its cv2.imshow,
-# Qt event loop, drawing, etc. all happen with a separate GIL and a separate
-# interpreter. Nothing it does can stall the UDP recv thread or the control
-# loop in the parent process. We communicate over a maxsize=1 queue and drop
-# frames if the viewer is behind — the viewer is purely cosmetic.
+# ── FPV viewer thread ─────────────────────────────────────────────────────────
 
-def _fpv_viewer_process(q, scale, cam_w, cam_h, gate_size_close):
+class FpvViewerThread(threading.Thread):
     """
-    Child-process entry point. Receives (frame, detection, state) tuples and
-    renders them with cv2.imshow. `detection` is (cx, cy, size) or None.
-    `state` is a (x, y, z, yaw) tuple. A None message is the shutdown sentinel.
+    Live FPV window. Polls the camera's latest frame, runs the gate detector
+    for an overlay (center crosshair + size + bounding info), and displays
+    via cv2.imshow. Press 'q' inside the window to close it (mission keeps
+    running; emergency stop is handled by the pynput listener).
     """
-    import cv2 as _cv2  # re-import inside child so spawn-based start works
-    import numpy as _np
 
-    win = 'Crazyflie FPV'
-    _cv2.namedWindow(win, _cv2.WINDOW_NORMAL)
-    _cv2.resizeWindow(win, cam_w * scale, cam_h * scale)
-    while True:
-        try:
-            msg = q.get(timeout=0.5)
-        except Exception:
-            # No frame in 500 ms — still pump the GUI so the window is responsive
-            if (_cv2.waitKey(1) & 0xFF) == ord('Q'):
+    def __init__(self, cam: 'UdpVideoThread', ctrl=None):
+        super().__init__(daemon=True, name='FpvViewerThread')
+        self._cam = cam
+        self._ctrl = ctrl
+        self._running = False
+
+    def start(self):
+        self._running = True
+        super().start()
+
+    def stop(self):
+        self._running = False
+
+    @staticmethod
+    def _detect_overlay(frame):
+        """
+        Re-runs the gate-detection pipeline (independently from the control
+        path) and returns drawable data: the winning rotated rect plus a list
+        of rejected contour rects, so the FPV view can visualize the detector.
+        """
+        bgr = frame if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, GATE_HSV_LOWER, GATE_HSV_UPPER)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((20, 5), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 20), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+        mask = _fill_holes(mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        best_score = 0.0
+        best_rect = None
+        rejected = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 250:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            (_, _), (rw, rh), _ = rect
+            if rw < 10 or rh < 10:
+                continue
+            short_side, long_side = sorted([rw, rh])
+            aspect = short_side / long_side
+            rotated_area = rw * rh
+            rectangularity = area / rotated_area
+            hull_area = cv2.contourArea(cv2.convexHull(cnt))
+            solidity = area / hull_area if hull_area > 0 else 0.0
+            if aspect < 0.45 or rectangularity < 0.80 or solidity < 0.85:
+                rejected.append(rect)
+                continue
+            score = rectangularity * solidity * np.log1p(area)
+            if score > best_score:
+                if best_rect is not None:
+                    rejected.append(best_rect)
+                best_score = score
+                best_rect = rect
+            else:
+                rejected.append(rect)
+        return mask, best_rect, rejected
+
+    def run(self):
+        win = 'Crazyflie FPV'
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE)
+        last = None
+        period = 1.0 / max(1.0, FPV_RATE_HZ)
+        next_t = time.time()
+        while self._running:
+            # Throttle the loop with time.sleep (releases the GIL cleanly so
+            # the UDP receiver thread can keep up with incoming packets).
+            now = time.time()
+            if now < next_t:
+                time.sleep(min(period, next_t - now))
+                # Still pump the GUI event queue so the window stays responsive
+                cv2.waitKey(1)
+                continue
+            next_t = now + period
+
+            frame = self._cam.latest_frame
+            if frame is None or frame is last:
+                cv2.waitKey(1)
+                continue
+            last = frame
+            disp = frame.copy()
+
+            # Detection overlay (re-run independently of control)
+            _mask, best_rect, rejected = self._detect_overlay(frame)
+            cv2.line(disp, (CAM_WIDTH // 2, 0), (CAM_WIDTH // 2, CAM_HEIGHT),
+                     (60, 60, 60), 1)
+            cv2.line(disp, (0, CAM_HEIGHT // 2), (CAM_WIDTH, CAM_HEIGHT // 2),
+                     (60, 60, 60), 1)
+
+            # Rejected candidates in faint red
+            for rect in rejected:
+                box = cv2.boxPoints(rect).astype(np.int32)
+                cv2.drawContours(disp, [box], 0, (0, 0, 180), 1)
+
+            if best_rect is not None:
+                (rcx, rcy), (rw, rh), _ = best_rect
+                size = max(rw, rh)
+                color = (0, 255, 0) if size >= GATE_SIZE_CLOSE else (0, 200, 255)
+                box = cv2.boxPoints(best_rect).astype(np.int32)
+                cv2.drawContours(disp, [box], 0, color, 2)
+                cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
+                               cv2.MARKER_CROSS, 14, 2)
+                cv2.putText(disp,
+                            f'cx={rcx:.0f} cy={rcy:.0f} size={size:.0f}',
+                            (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            else:
+                cv2.putText(disp, 'no gate', (5, 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+            # Pose overlay
+            if self._ctrl is not None:
+                s = self._ctrl._state
+                cv2.putText(disp,
+                            f"x={s['x']:+.2f} y={s['y']:+.2f} z={s['z']:.2f} yaw={s['yaw']:+.0f}",
+                            (5, CAM_HEIGHT - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.42, (255, 255, 255), 1)
+
+            if FPV_SCALE != 1:
+                disp = cv2.resize(disp,
+                                  (CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE),
+                                  interpolation=cv2.INTER_NEAREST)
+            cv2.imshow(win, disp)
+            if (cv2.waitKey(1) & 0xFF) == ord('Q'):  # capital Q only — lowercase q is emergency stop
                 break
-            continue
-        if msg is None:
-            break
-        frame, det, state = msg
-        disp = frame.copy() if frame.ndim == 3 else _cv2.cvtColor(frame, _cv2.COLOR_GRAY2BGR)
-
-        # Crosshair
-        _cv2.line(disp, (cam_w // 2, 0), (cam_w // 2, cam_h), (60, 60, 60), 1)
-        _cv2.line(disp, (0, cam_h // 2), (cam_w, cam_h // 2), (60, 60, 60), 1)
-
-        if det is not None:
-            rcx, rcy, size = det
-            color = (0, 255, 0) if size >= gate_size_close else (0, 200, 255)
-            half = int(size / 2)
-            _cv2.rectangle(disp,
-                           (int(rcx) - half, int(rcy) - half),
-                           (int(rcx) + half, int(rcy) + half),
-                           color, 2)
-            _cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
-                            _cv2.MARKER_CROSS, 14, 2)
-            _cv2.putText(disp, f'cx={rcx:.0f} cy={rcy:.0f} size={size:.0f}',
-                         (5, 18), _cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        else:
-            _cv2.putText(disp, 'no gate', (5, 18),
-                         _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-        if state is not None:
-            sx, sy, sz, syaw = state
-            _cv2.putText(disp,
-                         f"x={sx:+.2f} y={sy:+.2f} z={sz:.2f} yaw={syaw:+.0f}",
-                         (5, cam_h - 6), _cv2.FONT_HERSHEY_SIMPLEX,
-                         0.42, (255, 255, 255), 1)
-
-        if scale != 1:
-            disp = _cv2.resize(disp, (cam_w * scale, cam_h * scale),
-                               interpolation=_cv2.INTER_NEAREST)
-        _cv2.imshow(win, disp)
-        if (_cv2.waitKey(1) & 0xFF) == ord('Q'):
-            break
-    try:
-        _cv2.destroyAllWindows()
-    except Exception:
-        pass
+        try:
+            cv2.destroyWindow(win)
+        except Exception:
+            pass
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -465,6 +517,136 @@ def get_gate_detection(frame):
     return None, None, None
 
 
+# ── minimum-jerk trajectory planner ─────────────────────────────────────────────
+
+class MotionPlanner3D:
+    """Minimum-jerk polynomial trajectory generator (5th-order per segment)."""
+
+    def run_planner(self, path_waypoints):
+        poly_coeffs = self.compute_poly_coefficients(path_waypoints)
+        self.trajectory_setpoints, self.time_setpoints = self.poly_setpoint_extraction(
+            poly_coeffs, path_waypoints)
+
+    def compute_poly_matrix(self, t):
+        # Rows: [position, velocity, acceleration, jerk, snap]
+        return np.array([
+            [t**5,     t**4,    t**3,    t**2,  t,  1],
+            [5*t**4,   4*t**3,  3*t**2,  2*t,   1,  0],
+            [20*t**3,  12*t**2, 6*t,     2,     0,  0],
+            [60*t**2,  24*t,    6,       0,     0,  0],
+            [120*t,    24,      0,       0,     0,  0],
+        ])
+
+    def compute_poly_coefficients(self, path_waypoints):
+        seg_times = np.diff(self.times)
+        m = len(path_waypoints)
+        poly_coeffs = np.zeros((6 * (m - 1), 3))
+
+        for dim in range(3):
+            A = np.zeros((6 * (m - 1), 6 * (m - 1)))
+            b = np.zeros(6 * (m - 1))
+            pos = np.array([p[dim] for p in path_waypoints])
+            A_0 = self.compute_poly_matrix(0)
+
+            row = 0
+            for i in range(m - 1):
+                A_f = self.compute_poly_matrix(seg_times[i])
+                if i == 0:
+                    A[row, i*6:(i+1)*6] = A_0[0]; b[row] = pos[i];   row += 1
+                    A[row, i*6:(i+1)*6] = A_0[1]; b[row] = 0;        row += 1
+                    A[row, i*6:(i+1)*6] = A_0[2]; b[row] = 0;        row += 1
+                    A[row, i*6:(i+1)*6] = A_f[0]; b[row] = pos[i+1]; row += 1
+                    A[row:row+4, i*6:(i+1)*6]     =  A_f[1:]
+                    A[row:row+4, (i+1)*6:(i+2)*6] = -A_0[1:]
+                    b[row:row+4] = 0; row += 4
+                elif i < m - 2:
+                    A[row, i*6:(i+1)*6] = A_0[0]; b[row] = pos[i];   row += 1
+                    A[row, i*6:(i+1)*6] = A_f[0]; b[row] = pos[i+1]; row += 1
+                    A[row:row+4, i*6:(i+1)*6]     =  A_f[1:]
+                    A[row:row+4, (i+1)*6:(i+2)*6] = -A_0[1:]
+                    b[row:row+4] = 0; row += 4
+                elif i == m - 2:
+                    A[row, i*6:(i+1)*6] = A_0[0]; b[row] = pos[i];   row += 1
+                    A[row, i*6:(i+1)*6] = A_f[0]; b[row] = pos[i+1]; row += 1
+                    A[row, i*6:(i+1)*6] = A_f[1]; b[row] = 0;        row += 1
+                    A[row, i*6:(i+1)*6] = A_f[2]; b[row] = 0;        row += 1
+
+            poly_coeffs[:, dim] = np.linalg.solve(A, b)
+        return poly_coeffs
+
+    def poly_setpoint_extraction(self, poly_coeffs, path_waypoints):
+        n = self.disc_steps * len(self.times)
+        x_vals, y_vals, z_vals = np.zeros((n, 1)), np.zeros((n, 1)), np.zeros((n, 1))
+        v_x, v_y, v_z = np.zeros((n, 1)), np.zeros((n, 1)), np.zeros((n, 1))
+        a_x, a_y, a_z = np.zeros((n, 1)), np.zeros((n, 1)), np.zeros((n, 1))
+
+        time_setpoints = np.linspace(self.times[0], self.times[-1], n)
+        cx = poly_coeffs[:, 0]
+        cy = poly_coeffs[:, 1]
+        cz = poly_coeffs[:, 2]
+
+        for i, t in enumerate(time_setpoints):
+            seg = min(max(np.searchsorted(self.times, t) - 1, 0), len(cx) - 1)
+            M = self.compute_poly_matrix(t - self.times[seg])
+            kx = cx[seg*6:(seg+1)*6]
+            ky = cy[seg*6:(seg+1)*6]
+            kz = cz[seg*6:(seg+1)*6]
+            x_vals[i] = M[0] @ kx; y_vals[i] = M[0] @ ky; z_vals[i] = M[0] @ kz
+            v_x[i] = M[1] @ kx;    v_y[i] = M[1] @ ky;    v_z[i] = M[1] @ kz
+            a_x[i] = M[2] @ kx;    a_y[i] = M[2] @ ky;    a_z[i] = M[2] @ kz
+
+        yaw_vals = np.zeros((n, 1))
+        trajectory_setpoints = np.hstack((x_vals, y_vals, z_vals, yaw_vals))
+
+        vel_max = np.max(np.sqrt(v_x**2 + v_y**2 + v_z**2))
+        acc_max = np.max(np.sqrt(a_x**2 + a_y**2 + a_z**2))
+        print(f'  [PLAN] max speed {vel_max:.2f} m/s, max accel {acc_max:.2f} m/s²')
+        assert vel_max <= self.vel_lim, f'planned velocity {vel_max:.2f} m/s exceeds limit'
+        assert acc_max <= self.acc_lim, f'planned acceleration {acc_max:.2f} m/s² exceeds limit'
+        return trajectory_setpoints, time_setpoints
+
+
+class WaypointPlanner3D(MotionPlanner3D):
+    """Minimum-jerk trajectory through given waypoints (no obstacles, no A*).
+    Yaw is set to follow the velocity direction, like the simulation."""
+
+    def __init__(self, waypoints, t_f, disc_steps=20, vel_lim=20.0, acc_lim=50.0):
+        self._t_f = t_f
+        self.disc_steps = disc_steps
+        self.vel_lim = vel_lim
+        self.acc_lim = acc_lim
+        self.path = waypoints
+
+        # Distribute total time t_f proportionally to segment distances
+        pts = np.array(waypoints, dtype=float)[:, :3]
+        dists = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        total = np.sum(dists)
+        if total < 1e-6:
+            self.times = np.linspace(0, t_f, len(waypoints))
+        else:
+            cum = np.concatenate(([0.0], np.cumsum(dists)))
+            self.times = (cum / total) * t_f
+
+        self.run_planner(waypoints)
+        self._apply_yaw()
+
+    def _apply_yaw(self):
+        sp = self.trajectory_setpoints
+        vx = np.gradient(sp[:, 0], self.time_setpoints)
+        vy = np.gradient(sp[:, 1], self.time_setpoints)
+        speed = np.sqrt(vx**2 + vy**2)
+        yaw = np.arctan2(vy, vx)
+        # Hold the last meaningful heading while nearly stationary
+        thresh = 0.2
+        last_good = yaw[np.argmax(speed > thresh)] if (speed > thresh).any() else 0.0
+        for i in range(len(yaw)):
+            if speed[i] > thresh:
+                last_good = yaw[i]
+            yaw[i] = last_good
+        sp[:, 3] = np.unwrap(yaw)
+        self.trajectory_setpoints = sp
+
+
 # ── flight controller ──────────────────────────────────────────────────────────
 
 class GateController:
@@ -477,30 +659,13 @@ class GateController:
         self._stop        = False
         self._state       = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0}
 
-        # Fresh-vs-stale detection bookkeeping. The AI-deck only delivers
-        # ~2–3 fps with notable latency, so the 20 Hz control loop must
-        # distinguish a NEW frame from a repeat of the last one.
-        self._last_frame_obj    = None  # identity of last processed frame
-        self._ema_cx            = None  # smoothed detection
-        self._ema_cy            = None
-        self._ema_size          = None
-
-        # Shared with FPV viewer (separate process). last_detection is
-        # (cx, cy, size) of the most recent successful detection, or None.
-        self.last_detection = None
-        self.last_detection_miss = False
-
-        # Optional multiprocessing.Queue (maxsize=1) the FPV process reads
-        # from. Wire it in from main; we push (frame, detection, state) here
-        # whenever we process a fresh frame, dropping silently if full.
-        self._fpv_q = None
-
         # Log config is set up after connection (called from main)
         lg = LogConfig(name='State', period_in_ms=100)
         lg.add_variable('stateEstimate.x', 'float')
         lg.add_variable('stateEstimate.y', 'float')
         lg.add_variable('stateEstimate.z', 'float')
         lg.add_variable('stabilizer.yaw',  'float')
+        lg.add_variable('pm.vbat', 'float') 
         try:
             self._cf.log.add_config(lg)
             lg.data_received_cb.add_callback(self._log_cb)
@@ -509,108 +674,27 @@ class GateController:
         except Exception as e:
             print(f'Log setup failed: {e}')
 
-    # ── detection polling (fresh vs stale frame) ──────────────────────────────
-    #
-    # The camera UDP stream tops out at ~2–3 fps. At a 20 Hz control loop, the
-    # SAME frame would be processed 7–10× in a row — every "stale" hit looking
-    # like a new detection. _poll_detection returns one of three statuses so
-    # callers can react ONLY on fresh information.
-
-    def _poll_detection(self):
-        """
-        Returns (cx, cy, size, status) where status ∈
-          'new_hit'  — fresh frame, gate detected (cx,cy,size are EMA-smoothed)
-          'new_miss' — fresh frame, no gate detected
-          'stale'    — same frame object as last poll (no fresh info available)
-        """
-        frame = self._cam.latest_frame if self._cam is not None else None
-        if frame is None or frame is self._last_frame_obj:
-            return None, None, None, 'stale'
-        self._last_frame_obj = frame
-
-        cx, cy, size = get_gate_detection(frame)
-        if cx is None:
-            self.last_detection = None
-            self.last_detection_miss = True
-            self._push_fpv(frame, None)
-            return None, None, None, 'new_miss'
-
-        # EMA smoothing — damp single-frame outliers (one wild detection out
-        # of every 3 frames is a 33% noise pulse without smoothing).
-        a = DETECT_EMA_ALPHA
-        if self._ema_cx is None:
-            self._ema_cx, self._ema_cy, self._ema_size = cx, cy, size
-        else:
-            self._ema_cx   = a * cx   + (1 - a) * self._ema_cx
-            self._ema_cy   = a * cy   + (1 - a) * self._ema_cy
-            self._ema_size = a * size + (1 - a) * self._ema_size
-        self.last_detection = (self._ema_cx, self._ema_cy, self._ema_size)
-        self.last_detection_miss = False
-        self._push_fpv(frame, self.last_detection)
-        return self._ema_cx, self._ema_cy, self._ema_size, 'new_hit'
-
-    def _push_fpv(self, frame, det):
-        """Non-blocking send to the FPV viewer process. Drops if the queue is
-        full so the control loop never waits on the GUI."""
-        if self._fpv_q is None:
-            return
-        state = (self._state['x'], self._state['y'],
-                 self._state['z'], self._state['yaw'])
-        try:
-            self._fpv_q.put_nowait((frame, det, state))
-        except queue_mod.Full:
-            pass
-
-    def _reset_detection_filter(self):
-        """Clear EMA state — call when entering a new visual-servo phase
-        so we don't carry pixel state across gates / search → approach."""
-        self._ema_cx = None
-        self._ema_cy = None
-        self._ema_size = None
-
     def _log_cb(self, timestamp, data, logconf):
         self._state['x']   = data['stateEstimate.x']
         self._state['y']   = data['stateEstimate.y']
         self._state['z']   = data['stateEstimate.z']
         self._state['yaw'] = data['stabilizer.yaw']
+
+        # BATTERY DEBUG
+        vbat = data['pm.vbat']                               
+        self._state['vbat'] = vbat                          
+        if vbat < 3.7 and time.time() - getattr(self, '_last_vbat_warn', 0) > 1.0:
+            print(f'  [LOW BATTERY] vbat={vbat:.2f} V')
+            self._last_vbat_warn = time.time()
         # Uncomment to debug:
         # r = math.sqrt(self._state['x']**2 + self._state['y']**2)
         # print(f"x={self._state['x']:.2f}  y={self._state['y']:.2f}  "
         #       f"z={self._state['z']:.2f}  yaw={self._state['yaw']:.1f}  r={r:.2f}")
 
-    # ── boundary-safe hover ──────────────────────────────────────────────────
+    # ── hover / stop ──────────────────────────────────────────────────
 
-    def _safe_hover(self, vx=0.0, vy=0.0, yaw_rate=0.0, z=CRUISE_ALT):
-        """
-        Send hover setpoint, blocking outward velocity at the arena boundary.
-
-        For each axis independently: if the drone is past the safety line and
-        trying to move further into the wall, zero that velocity component.
-        Tangential and inward motion are unaffected.
-        """
-        x   = self._state['x']
-        y   = self._state['y']
-        yaw = math.radians(self._state['yaw'])
-
-        # Body → world
-        wx = vx * math.cos(yaw) - vy * math.sin(yaw)
-        wy = vx * math.sin(yaw) + vy * math.cos(yaw)
-
-        # Hard cutoff per axis
-        if x <= ARENA_X_MIN + SAFETY_MARGIN_HARD and wx < 0:
-            wx = 0.0
-        if x >= ARENA_X_MAX - SAFETY_MARGIN_HARD and wx > 0:
-            wx = 0.0
-        if y <= ARENA_Y_MIN + SAFETY_MARGIN_HARD and wy < 0:
-            wy = 0.0
-        if y >= ARENA_Y_MAX - SAFETY_MARGIN_HARD and wy > 0:
-            wy = 0.0
-
-        # World → body
-        vx_s =  wx * math.cos(yaw) + wy * math.sin(yaw)
-        vy_s = -wx * math.sin(yaw) + wy * math.cos(yaw)
-
-        self._cf.commander.send_hover_setpoint(vx_s, vy_s, yaw_rate, z)
+    def _hover(self, vx=0.0, vy=0.0, yaw_rate=0.0, z=CRUISE_ALT):
+        self._cf.commander.send_hover_setpoint(vx, vy, yaw_rate, z)
 
     def _stop_motors(self):
         self._cf.commander.send_stop_setpoint()
@@ -621,10 +705,10 @@ class GateController:
         print(f'Taking off to {target_z:.2f} m')
         steps = int(TAKEOFF_DURATION / 0.1)
         for i in range(steps):
-            self._safe_hover(z=target_z * (i / steps))
+            self._hover(z=target_z * (i / steps))
             time.sleep(0.1)
         for _ in range(20):
-            self._safe_hover(z=target_z)
+            self._hover(z=target_z)
             time.sleep(0.1)
 
     def land(self):
@@ -632,7 +716,7 @@ class GateController:
         current_z = max(self._state['z'], CRUISE_ALT)
         steps = int(LAND_DURATION / 0.1)
         for i in range(steps):
-            self._safe_hover(z=current_z * (1.0 - i / steps))
+            self._hover(z=current_z * (1.0 - i / steps))
             time.sleep(0.1)
         self._stop_motors()
 
@@ -644,84 +728,54 @@ class GateController:
         Oscillates the yaw back and forth to scan the immediate area.
         """
         print('  [SEARCH] Sweeping...')
-        self._reset_detection_filter()
         t_start = time.time()
-        tick = 0
-        frames_seen = 0
 
         while not self._stop:
-            # 1. Check the camera — react only to FRESH frames
-            cx, cy, size, status = self._poll_detection()
-            if status != 'stale':
-                frames_seen += 1
-            if status == 'new_hit':
-                print(f'  [SEARCH] gate found  cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px '
-                      f'after {time.time() - t_start:.1f}s, yaw={self._state["yaw"]:+.0f}deg '
-                      f'(frames_seen={frames_seen})')
+            # 1. Check the camera
+            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            if cx is not None:
+                print(f'  [SEARCH] gate found  cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px')
                 return
 
-            # 2. Execute flight pattern
+            # 2. Start to look around
             elapsed = time.time() - t_start
 
-            # Oscillate yaw rate like a pendulum to sweep the camera
-            sweep_yaw_rate = math.sin(elapsed * math.pi / 5) * SEARCH_YAW_RATE
-            self._safe_hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
+            # Sinusoidal sweep: ±45° at SEARCH_SWEEP_RATE deg/s peak
+            # amplitude = SEARCH_SWEEP_RATE / ω = SEARCH_SWEEP_RATE × T/(2π) ≈ 45°
+            sweep_yaw_rate = math.sin(elapsed * 2 * math.pi / SEARCH_SWEEP_PERIOD) * SEARCH_SWEEP_RATE
+            self._hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
 
-            # Periodic heartbeat so we know search is alive (also reports
-            # measured camera fps so we can confirm the AI-deck is healthy)
-            tick += 1
-            if tick % 10 == 0:  # every ~1 s at 0.1 s loop
-                fps = frames_seen / max(elapsed, 0.001)
-                print(f'  [SEARCH] tick={tick} t={elapsed:.1f}s fps={fps:.1f} '
-                      f'yaw={self._state["yaw"]:+.0f}deg yaw_rate={sweep_yaw_rate:+.1f}deg/s '
-                      f'pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f},{self._state["z"]:.2f})')
-
-            time.sleep(0.1)
+            time.sleep(0.05)
 
     # ── state: LOCK ──────────────────────────────────────────────────────────
 
     def lock_on_gate(self):
         """
         After SEARCH first spots a gate, stop yawing and hover in place for
-        LOCK_DURATION seconds, polling the detector each tick. Confirmation
-        requires LOCK_MIN_HITS consecutive detections (filters single-frame
-        flukes). Returns True if confirmed, else False (caller falls back to
-        SEARCH).
+        LOCK_DURATION seconds. Requires the gate to be detected in at least
+        50% of ticks — a single false-positive from SEARCH is not enough to
+        pass. Returns True if confirmed, False → back to SEARCH.
         """
-        print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection '
-              f'(need {LOCK_MIN_HITS} total UNIQUE-FRAME hits, non-consecutive)')
-        # Don't reset EMA here — keep refining the smoothed pose from search.
+        print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection')
         t_end = time.time() + LOCK_DURATION
-        hits = 0
-        misses = 0
-        stale = 0
+        n_ticks = 0
+        n_detected = 0
         last = None
-        tick = 0
         while time.time() < t_end and not self._stop:
-            cx, cy, size, status = self._poll_detection()
-            tick += 1
-            if status == 'new_hit':
-                hits += 1
+            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            n_ticks += 1
+            if cx is not None:
+                n_detected += 1
                 last = (cx, cy, size)
-                # Early-exit as soon as we have enough hits (no need to wait out
-                # the full window — the lock is "less strict" now).
-                if hits >= LOCK_MIN_HITS:
-                    break
-            elif status == 'new_miss':
-                misses += 1
-            else:
-                stale += 1
-            self._safe_hover(z=CRUISE_ALT)
-            time.sleep(0.1)
+            self._hover(z=CRUISE_ALT)
+            time.sleep(0.05)
 
-        unique = hits + misses
-        if hits >= LOCK_MIN_HITS and last is not None:
-            print(f'  [LOCK] CONFIRMED  hits={hits} unique_frames={unique} '
-                  f'stale_ticks={stale} '
-                  f'last(cx={last[0]:.0f},size={last[2]:.0f}px) → APPROACH')
+        rate = n_detected / n_ticks if n_ticks > 0 else 0.0
+        if last is not None and rate >= 0.5:
+            print(f'  [LOCK] confirmed ({n_detected}/{n_ticks} detections,'
+                  f' cx={last[0]:.0f} size={last[2]:.0f}px) → APPROACH')
             return True
-        print(f'  [LOCK] FAILED  hits={hits} (<{LOCK_MIN_HITS}) '
-              f'unique_frames={unique} stale_ticks={stale} → SEARCH')
+        print(f'  [LOCK] rejected ({n_detected}/{n_ticks} detections, {rate:.0%}) → SEARCH')
         return False
 
     # ── state: APPROACH ──────────────────────────────────────────────────────
@@ -742,68 +796,35 @@ class GateController:
         Returns False when gate lost > LOST_TOLERANCE (→ SEARCH).
         """
         print('  [APPROACH] IBVS toward gate')
-        # Keep EMA from lock (already converged to the gate); just record start.
         cx_mid   = CAM_WIDTH  / 2.0   # 162 px
         cy_mid   = CAM_HEIGHT / 2.0   # 122 px
         target_z = CRUISE_ALT
-        tick     = 0
-        t_start  = time.time()
-        t_last_hit = time.time()  # wall-clock timestamp of last fresh hit
-        frames_seen = 0
-
-        # Last commanded velocities — re-sent on stale ticks so the drone keeps
-        # progressing between sparse camera frames instead of stuttering. They
-        # are ONLY refreshed on a 'new_hit' tick (true closed-loop update).
-        last_vx = 0.0
-        last_vy = 0.0
+        lost     = 0
 
         while not self._stop:
-            cx, cy, size, status = self._poll_detection()
-            tick += 1
+            cx, cy, size = get_gate_detection(self._cam.latest_frame)
 
-            # ── Stale tick: re-send last command, do NOT recompute from old pixels.
-            if status == 'stale':
-                age = time.time() - t_last_hit
-                if age > LOST_TIMEOUT_S:
-                    print(f'  [APPROACH] LOST {age:.2f}s with no fresh frame → SEARCH '
-                          f'(approach lasted {time.time() - t_start:.1f}s, '
-                          f'fresh_frames={frames_seen})')
+            if cx is None:
+                lost += 1
+                if lost > LOST_TOLERANCE:
+                    print('  [APPROACH] gate lost — back to SEARCH')
                     return False
-                self._safe_hover(vx=last_vx, vy=last_vy, z=target_z)
-                time.sleep(0.1)
+                # Hold last commanded altitude while waiting for gate to reappear
+                self._hover(z=target_z)
+                time.sleep(0.05)
                 continue
 
-            # ── Fresh frame received (hit or miss).
-            frames_seen += 1
+            lost = 0
 
-            if status == 'new_miss':
-                age = time.time() - t_last_hit
-                if age > LOST_TIMEOUT_S:
-                    print(f'  [APPROACH] gate lost {age:.2f}s → SEARCH '
-                          f'(approach lasted {time.time() - t_start:.1f}s, '
-                          f'fresh_frames={frames_seen})')
-                    return False
-                # Coast on the last good command but never accelerate from stale data
-                self._safe_hover(vx=last_vx, vy=last_vy, z=target_z)
-                time.sleep(0.1)
-                continue
-
-            # status == 'new_hit'
-            t_last_hit = time.time()
-
-            # ── Step 1: pixel errors ────────────────────────────────────────
-            e_x = -cx + cx_mid          # +ve → gate left of centre (strafe left)
-            e_y = cy_mid - cy           # +ve → gate above centre
-            e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small → move forward
-
-            # ── Step 2: check termination — only TRANSIT if also aligned ────
-            size_ok  = size >= GATE_SIZE_CLOSE
-            align_ok = abs(e_x) < ALIGN_TOL_X and abs(e_y) < ALIGN_TOL_Y
-            if size_ok and align_ok:
-                print(f'  [APPROACH] DONE  size={size:.0f}px>={GATE_SIZE_CLOSE} '
-                      f'ex={e_x:+.0f}<{ALIGN_TOL_X} ey={e_y:+.0f}<{ALIGN_TOL_Y} '
-                      f'after {time.time() - t_start:.1f}s → TRANSIT')
+            # ── Step 1: check termination ───────────────────────────────────
+            if size >= GATE_SIZE_CLOSE:
+                print(f'  [APPROACH] gate fills frame (size={size:.0f}px) → TRANSIT')
                 return True
+
+            # ── Step 2: pixel errors ────────────────────────────────────────
+            e_x = -cx + cx_mid          # +ve → gate right of centre
+            e_y = cy_mid - cy          # +ve → gate above centre
+            e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small → move forward
 
             # ── Step 3: proportional control ────────────────────────────────
             v_strafe  = KP_VY * e_x
@@ -815,81 +836,29 @@ class GateController:
             v_climb   = clamp(v_climb,   -MAX_VZ_DELTA, MAX_VZ_DELTA)
             v_forward = clamp(v_forward,  0.0,     MAX_VX)   # never fly backward
 
-            # ── Step 4b: throttle forward speed by alignment ────────────────
-            # When the gate is off-centre, slow forward motion so the drone
-            # has time to strafe/climb into alignment instead of barrelling
-            # diagonally toward the gate plane.
-            mis_x = abs(e_x) / cx_mid   # 0 = centred, 1 = at frame edge
-            mis_y = abs(e_y) / cy_mid
-            align_factor = clamp(1.0 - (mis_x + mis_y) / ALIGN_SCALE_DENOM, 0.0, 1.0)
-            v_forward *= align_factor
-
             target_z  = clamp(CRUISE_ALT + v_climb,
                               CRUISE_ALT - MAX_VZ_DELTA,
                               CRUISE_ALT + MAX_VZ_DELTA)
 
-            # Throttle to ~1 Hz so console I/O doesn't starve UDP recv thread
-            if tick % 10 == 0:
-                sx = 'OK' if size_ok else '--'
-                ax = 'OK' if align_ok else '--'
-                fps = frames_seen / max(time.time() - t_start, 0.001)
-                print(f'  [IBVS] t={tick:4d} f={frames_seen} fps={fps:.1f}  '
-                      f'cx={cx:6.1f} cy={cy:6.1f} sz={size:5.1f}px '
-                      f'[{sx}|{ax}]  ex={e_x:+5.0f} ey={e_y:+5.0f} ez={e_z:+5.0f}  '
-                      f'align={align_factor:.2f}  vx={v_forward:.3f} vy={v_strafe:+.3f} '
-                      f'z={target_z:.2f}  pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f})')
+            print(f'  [IBVS] ex={e_x:+.0f}px ey={e_y:+.0f}px size={size:.0f}px'
+                  f'  → vx={v_forward:.2f} vy={v_strafe:+.2f} z={target_z:.2f}')
 
-            # ── Step 5: cache + send command ─────────────────────────────────
-            # Cache for stale-tick re-send (no fresh frame → coast on last cmd)
-            last_vx, last_vy = v_forward, v_strafe
-            self._safe_hover(vx=v_forward, vy=v_strafe, z=target_z)
-            time.sleep(0.1)
+            # ── Step 5: send command ─────────────────────────────────────────
+            self._hover(vx=v_forward, vy=v_strafe, z=target_z)
+            time.sleep(0.05)
 
         return False
 
     # ── state: TRANSIT ───────────────────────────────────────────────────────
 
     def transit_gate(self):
-        """
-        Push forward to clear the gate. For as long as the detector still sees
-        the gate (i.e. we haven't passed the plane yet) keep correcting lateral
-        and vertical pixel error so a late drift doesn't clip the frame. Once
-        the gate disappears from view, finish the push open-loop.
-        """
-        print(f'  [TRANSIT] flying through gate (vx={TRANSIT_VX} m/s for {TRANSIT_TIME}s)')
-        cx_mid = CAM_WIDTH  / 2.0
-        cy_mid = CAM_HEIGHT / 2.0
-        target_z = CRUISE_ALT
+        """Push straight forward for TRANSIT_TIME to clear the gate."""
+        print('  [TRANSIT] flying through gate')
         t_end = time.time() + TRANSIT_TIME
-        tick = 0
-        seen = 0
-        miss = 0
-        stale = 0
-        last_vy = 0.0
         while time.time() < t_end and not self._stop:
-            cx, cy, _size, status = self._poll_detection()
-            tick += 1
-            if status == 'new_hit':
-                seen += 1
-                e_x = -cx + cx_mid
-                e_y = cy_mid - cy
-                v_strafe = clamp(KP_VY * e_x, -MAX_VY, MAX_VY)
-                v_climb  = clamp(KP_VZ * e_y, -MAX_VZ_DELTA, MAX_VZ_DELTA)
-                target_z = clamp(CRUISE_ALT + v_climb,
-                                 CRUISE_ALT - MAX_VZ_DELTA,
-                                 CRUISE_ALT + MAX_VZ_DELTA)
-                last_vy = v_strafe
-                self._safe_hover(vx=TRANSIT_VX, vy=v_strafe, z=target_z)
-            elif status == 'new_miss':
-                miss += 1
-                # Gate no longer visible → past the plane, drive straight forward
-                self._safe_hover(vx=TRANSIT_VX, z=target_z)
-            else:  # stale — keep coasting on last command
-                stale += 1
-                self._safe_hover(vx=TRANSIT_VX, vy=last_vy, z=target_z)
-            time.sleep(0.1)
-        print(f'  [TRANSIT] done (seen={seen} miss={miss} stale={stale} ticks, '
-              f'pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f},{self._state["z"]:.2f}))')
+            self._hover(vx=TRANSIT_VX, z=CRUISE_ALT)
+            time.sleep(0.05)
+        print('  [TRANSIT] done')
 
     # ── mission: Part 1 — vision ─────────────────────────────────────────────
 
@@ -935,8 +904,8 @@ class GateController:
             yaw_rate = clamp(WAYPOINT_YAW_KP * yaw_err,
                              -SEARCH_YAW_RATE, SEARCH_YAW_RATE)
 
-            self._safe_hover(vx=bvx, vy=bvy, yaw_rate=yaw_rate, z=wz)
-            time.sleep(0.1)
+            self._hover(vx=bvx, vy=bvy, yaw_rate=yaw_rate, z=wz)
+            time.sleep(0.05)
 
         return 'stopped'
 
@@ -975,7 +944,6 @@ class GateController:
                     break
 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
-                self._reset_detection_filter()  # fresh EMA per gate
 
                 # 1. Sweep yaw until the gate appears in frame, then hover to
                 #    confirm the detection is stable before committing.
@@ -1051,139 +1019,77 @@ class GateController:
     # PART 2 — position-based mission (known gate coordinates)
     # =========================================================================
 
-    def _clamp_to_boundary(self, x, y):
-        """Clamp a target (x, y) to the rectangular arena minus the hard safety margin."""
-        x_lo = ARENA_X_MIN + SAFETY_MARGIN_HARD
-        x_hi = ARENA_X_MAX - SAFETY_MARGIN_HARD
-        y_lo = ARENA_Y_MIN + SAFETY_MARGIN_HARD
-        y_hi = ARENA_Y_MAX - SAFETY_MARGIN_HARD
-        xc = clamp(x, x_lo, x_hi)
-        yc = clamp(y, y_lo, y_hi)
-        if (xc, yc) != (x, y):
-            print(f'  [BOUND] target ({x:.2f}, {y:.2f}) clamped to ({xc:.2f}, {yc:.2f})')
-        return xc, yc
-
     def _plan_lap(self, gates, start_xyz):
         """
-        Build the one-lap waypoint list: start → (pre, centre, post) per gate
-        → return to start. Yaw is set to face the flythrough direction at each
-        gate. Returns a list of (x, y, z, yaw_rad) tuples.
+        Build the one-lap waypoint list and fit a single minimum-jerk
+        trajectory through it.
 
-        Each gate is (x, y, z, theta, height, width). theta is the orientation
-        of the gate's PLANE; the flythrough axis is perpendicular to it.
+        Each gate is (x, y, z, theta, height, width):
+        x, y, z  — gate centre in the Lighthouse world frame (metres)
+        theta    — orientation of the gate's PLANE in the arena frame (radians).
+                    theta=0 means the plane lies along world X, so the drone
+                    flies through along world Y.
+        height   — gate opening height (unused; z is already the centre)
+        width    — gate opening width; used to cap the inward bias so we
+                    never aim through the gate frame itself.
         """
-        waypoints = [(start_xyz[0], start_xyz[1], start_xyz[2], 0.0)]
+        waypoints = [tuple(start_xyz)]
         prev_xy = (start_xyz[0], start_xyz[1])
 
         for g in gates:
-            gx, gy, gz, theta, _gw, _gh = g
+            gx, gy, gz, theta, gw, _gh = g
 
-            # Flythrough direction; flip if it points back toward where we came from.
-            dirx, diry = -math.sin(theta), math.cos(theta)
-            if (gx - prev_xy[0]) * dirx + (gy - prev_xy[1]) * diry < 0:
-                dirx, diry = -dirx, -diry
-            yaw = math.atan2(diry, dirx)
+            # Gate's plane direction, then flythrough direction (perpendicular).
+            # Two candidate flythrough axes: ±(-sin θ, cos θ). Pick whichever
+            # points AWAY from the previous waypoint so the drone keeps moving
+            # forward through the course instead of doubling back.
+            nx, ny = -math.sin(theta), math.cos(theta)
+            if (gx - prev_xy[0]) * nx + (gy - prev_xy[1]) * ny < 0:
+                nx, ny = -nx, -ny
+            dirx, diry = nx, ny
 
-            px, py = self._clamp_to_boundary(gx - PRE_GATE_OFFSET * dirx,
-                                            gy - PRE_GATE_OFFSET * diry)
-            cx, cy = self._clamp_to_boundary(gx, gy)
-            qx, qy = self._clamp_to_boundary(gx + POST_GATE_OFFSET * dirx,
-                                            gy + POST_GATE_OFFSET * diry)
-            waypoints.append((px, py, gz, yaw))
-            waypoints.append((cx, cy, gz, yaw))
-            waypoints.append((qx, qy, gz, yaw))
-
-            prev_xy = (qx, qy)
-
-        waypoints.append((start_xyz[0], start_xyz[1], CRUISE_ALT, 0.0))
-        return waypoints
-
-    def _follow_path_pure_pursuit(self, waypoints, dt):
-        """
-        Stream a moving carrot point along the polyline `waypoints`
-        (list of (x, y, z, yaw_rad)). At each tick we find the drone's closest
-        point on the path, then walk forward along segments by PURSUIT_LOOKAHEAD
-        metres to get the carrot, and send that as the position setpoint.
-
-        Yaw at the carrot is interpolated from the surrounding segment's yaws.
-        The path is considered finished when the projection reaches the final
-        segment and the drone is within WAYPOINT_REACH_TOL of the last point.
-        """
-        if len(waypoints) < 2:
-            return
-
-        pts = [np.array([w[0], w[1], w[2]]) for w in waypoints]
-        yaws = [w[3] for w in waypoints]
-        seg_idx = 0  # current segment is pts[seg_idx] → pts[seg_idx+1]
-
-        while not self._stop:
-            drone = np.array([self._state['x'], self._state['y'], self._state['z']])
-
-            # Project drone onto current segment; if past its end, advance.
-            while seg_idx < len(pts) - 2:
-                a, b = pts[seg_idx], pts[seg_idx + 1]
-                ab = b - a
-                ab_len2 = float(ab @ ab)
-                if ab_len2 < 1e-9:
-                    seg_idx += 1
-                    continue
-                t = float((drone - a) @ ab) / ab_len2
-                if t >= 1.0:
-                    seg_idx += 1
-                else:
-                    break
-
-            # Termination: on the last segment and near the final waypoint.
-            if seg_idx >= len(pts) - 1:
-                break
-            if seg_idx == len(pts) - 2:
-                if np.linalg.norm(drone - pts[-1]) < WAYPOINT_REACH_TOL:
-                    break
-
-            # Carrot: start from projection on current segment, then walk
-            # forward along the polyline by PURSUIT_LOOKAHEAD metres.
-            a, b = pts[seg_idx], pts[seg_idx + 1]
-            ab = b - a
-            ab_len = float(np.linalg.norm(ab))
-            if ab_len < 1e-9:
-                t = 0.0
+            # Inward bias: shift pre/post waypoints toward the arena origin.
+            # The bias direction is along the gate's PLANE (perpendicular to
+            # flythrough), pointing toward origin. Cap by gate half-width so we
+            # never aim outside the gate opening.
+            r = math.hypot(gx, gy)
+            if r > 1e-6 and GATE_INWARD_BIAS > 0:
+                # Unit vector from gate toward origin
+                ix_full, iy_full = -gx / r, -gy / r
+                # Project onto the gate-plane axis (perpendicular to flythrough)
+                plane_x, plane_y = -diry, dirx
+                proj = ix_full * plane_x + iy_full * plane_y
+                bias = clamp(GATE_INWARD_BIAS, 0.0, 0.45 * gw) * proj
+                bx, by = bias * plane_x, bias * plane_y
             else:
-                t = clamp(float((drone - a) @ ab) / (ab_len * ab_len), 0.0, 1.0)
+                bx, by = 0.0, 0.0
 
-            remaining = PURSUIT_LOOKAHEAD
-            cur_seg = seg_idx
-            cur_t = t
-            carrot = a + t * ab
-            carrot_yaw = yaws[cur_seg + 1]
-            while remaining > 0 and cur_seg < len(pts) - 1:
-                sa, sb = pts[cur_seg], pts[cur_seg + 1]
-                seg_vec = sb - sa
-                seg_len = float(np.linalg.norm(seg_vec))
-                left = seg_len * (1.0 - cur_t)
-                if left >= remaining:
-                    cur_t += remaining / seg_len if seg_len > 1e-9 else 0.0
-                    carrot = sa + cur_t * seg_vec
-                    carrot_yaw = yaws[cur_seg + 1]
-                    remaining = 0
-                else:
-                    remaining -= left
-                    cur_seg += 1
-                    cur_t = 0.0
-                    if cur_seg >= len(pts) - 1:
-                        carrot = pts[-1]
-                        carrot_yaw = yaws[-1]
-                        break
+            # Three colinear waypoints along the flythrough axis: before, centre, after.
+            # Pre and post are nudged inward by (bx, by); the centre is not.
+            px, py = self._clamp_to_boundary(gx - PRE_GATE_OFFSET * dirx + bx,
+                                            gy - PRE_GATE_OFFSET * diry + by)
+            cx, cy = self._clamp_to_boundary(gx, gy)
+            qx, qy = self._clamp_to_boundary(gx + POST_GATE_OFFSET * dirx + bx,
+                                            gy + POST_GATE_OFFSET * diry + by)
+            waypoints.append((px, py, gz))
+            waypoints.append((cx, cy, gz))
+            waypoints.append((qx, qy, gz))
 
-            self._cf.commander.send_position_setpoint(
-                float(carrot[0]), float(carrot[1]), float(carrot[2]),
-                math.degrees(carrot_yaw))
-            time.sleep(dt)
+            prev_xy = (qx, qy)   # next gate's flythrough sign is chosen relative
+                                # to where we just exited, not where we started.
+
+        waypoints.append((start_xyz[0], start_xyz[1], CRUISE_ALT))
+
+        return WaypointPlanner3D(waypoints, t_f=LAP_DURATION_S,
+                                disc_steps=TRAJ_DISC_STEPS,
+                                vel_lim=TRAJ_VEL_LIM, acc_lim=TRAJ_ACC_LIM)
 
     def run_fast_lap(self, gates, n_laps=N_LAPS):
         """
-        Part 2: gate positions are known. Stream raw (pre, centre, post)
-        waypoints per gate to the Crazyflie's onboard position controller,
-        advancing once the drone is within WAYPOINT_REACH_TOL of each.
+        Part 2: gate positions are known. For each lap, fit ONE minimum-jerk
+        polynomial trajectory through all gates and follow it open-loop by streaming
+        the time-indexed setpoints. The lap is re-planned from the current position
+        each lap so drift from the previous lap does not accumulate. Best lap counts.
         """
         if not gates:
             print('GATE_POSITIONS is empty — fill it in before running Part 2.')
@@ -1205,12 +1111,31 @@ class GateController:
                 print(f'\n=== Lap {lap + 1} / {n_laps} ===')
 
                 start_xyz = (self._state['x'], self._state['y'], self._state['z'])
-                waypoints = self._plan_lap(gates, start_xyz)
-
-                t_lap = time.time()
-                self._follow_path_pure_pursuit(waypoints, dt)
-                if self._stop:
+                try:
+                    planner = self._plan_lap(gates, start_xyz)
+                except AssertionError as e:
+                    print(f'  Trajectory infeasible ({e}). Increase LAP_DURATION_S.')
                     break
+
+                setpoints = planner.trajectory_setpoints
+
+                # Follow the trajectory spatially: advance to the next setpoint
+                # once the drone is within WAYPOINT_REACH_TOL of the current one,
+                # rather than assuming it tracks the time-indexed plan exactly.
+                t_lap = time.time()
+                n = 0
+                last_n = len(setpoints) - 1
+                while not self._stop and n <= last_n:
+                    sx, sy, sz, syaw = setpoints[n]
+                    self._cf.commander.send_position_setpoint(
+                        sx, sy, sz, math.degrees(syaw))
+
+                    dx = sx - self._state['x']
+                    dy = sy - self._state['y']
+                    dz = sz - self._state['z']
+                    if math.sqrt(dx*dx + dy*dy + dz*dz) < WAYPOINT_REACH_TOL:
+                        n += 1
+                    time.sleep(dt)
 
                 lap_times.append(time.time() - t_lap)
                 print(f'  Lap {lap + 1} time: {lap_times[-1]:.2f} s')
@@ -1327,14 +1252,6 @@ def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazy
 
 if __name__ == '__main__':
     assert MISSION in ('vision', 'position'), "MISSION must be 'vision' or 'position'"
-    # Start the camera thread FIRST (matches FPV example ordering) so the
-    # AI-deck receives START_MAGIC and begins streaming while the Crazyradio
-    # link is still being established.
-    cam = None
-    if MISSION == 'vision':
-        cam = UdpVideoThread()
-        cam.start()
-
     cflib.crtp.init_drivers()
 
     # Single Crazyflie instance over Crazyradio (control + logs)
@@ -1363,7 +1280,11 @@ if __name__ == '__main__':
         print('Connection timed out — exiting')
         exit(1)
 
-    if cam is not None:
+    # The camera is only needed for the vision mission.
+    cam = None
+    if MISSION == 'vision':
+        cam = UdpVideoThread()
+        cam.start()
         print('Waiting for first camera frame...')
         while cam.latest_frame is None:
             time.sleep(0.05)
@@ -1378,21 +1299,16 @@ if __name__ == '__main__':
         cf.close_link()
         exit(1)
 
-    # Live FPV window — runs in a SEPARATE PROCESS so its GUI work cannot
-    # GIL-stall the UDP recv thread or the control loop.
-    fpv_proc = None
-    fpv_q = None
+    # Live FPV window with detection overlay
+    fpv = None
     if FPV_ENABLED and cam is not None:
-        fpv_q = mp.Queue(maxsize=1)   # latest-wins; controller drops if full
-        ctrl._fpv_q = fpv_q
-        fpv_proc = mp.Process(
-            target=_fpv_viewer_process,
-            args=(fpv_q, FPV_SCALE, CAM_WIDTH, CAM_HEIGHT, GATE_SIZE_CLOSE),
-            daemon=True, name='FpvViewerProc')
-        fpv_proc.start()
-        print(f'FPV viewer process started (pid={fpv_proc.pid})')
+        fpv = FpvViewerThread(cam, ctrl)
+        fpv.start()
+        print('FPV viewer started')
 
     # Emergency stop listener
+    # threading.Thread(target=emergency_stop_listener,args=(ctrl, cam, cf), daemon=True).start()
+    # emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
     emergency_stop_thread = threading.Thread(target=emergency_stop_listener, args=(ctrl, cam, cf), daemon=True)
     emergency_stop_thread.start()
 
@@ -1402,13 +1318,8 @@ if __name__ == '__main__':
         else:
             ctrl.run_fast_lap(GATE_POSITIONS, N_LAPS)
     finally:
-        if fpv_q is not None:
-            try:
-                fpv_q.put_nowait(None)  # graceful shutdown sentinel
-            except Exception:
-                pass
-        if fpv_proc is not None:
-            fpv_proc.join(timeout=1.0)
+        if fpv is not None:
+            fpv.stop()
         if cam is not None:
             cam.stop()
         cf.close_link()
