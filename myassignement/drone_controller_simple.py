@@ -47,7 +47,9 @@ Press 'q' at any time for emergency stop.
 import contextlib
 import logging
 import math
+import multiprocessing as mp
 import os
+import queue as queue_mod
 import socket
 import struct
 import time
@@ -87,12 +89,13 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
 # ── FPV viewer ────────────────────────────────────────────────────────────────
+# The viewer now runs in a SEPARATE PROCESS (mp.Process). It receives frames
+# over a maxsize=1 queue — when the queue is full we drop, so the control
+# loop never waits on the GUI. Because the viewer has its own GIL/interpreter,
+# its render rate is no longer coupled to the recv thread; the rate is driven
+# by the camera's natural fps (~3 fps).
 FPV_ENABLED  = True   # show live camera window with detection overlay
 FPV_SCALE    = 2      # upscale factor for the display window
-FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
-                       # (kept low so the UDP receiver thread isn't GIL-starved
-                       #  — that was causing the AI-deck stream to stall after
-                       #  the first frame)
 
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
@@ -292,99 +295,76 @@ class UdpVideoThread(threading.Thread):
             self._frame = img
 
 
-# ── FPV viewer thread ─────────────────────────────────────────────────────────
+# ── FPV viewer (separate process) ────────────────────────────────────────────
+#
+# Runs in its OWN OS process via multiprocessing.Process so its cv2.imshow,
+# Qt event loop, drawing, etc. all happen with a separate GIL and a separate
+# interpreter. Nothing it does can stall the UDP recv thread or the control
+# loop in the parent process. We communicate over a maxsize=1 queue and drop
+# frames if the viewer is behind — the viewer is purely cosmetic.
 
-class FpvViewerThread(threading.Thread):
+def _fpv_viewer_process(q, scale, cam_w, cam_h, gate_size_close):
     """
-    Live FPV window. Polls the camera's latest frame, reads the controller's
-    LAST detection (does NOT re-run the detector — that work happens once per
-    frame in the control loop), and overlays a marker. Press capital 'Q'
-    inside the window to close it (mission keeps running; lowercase 'q' is
-    the emergency stop, handled by the pynput listener).
+    Child-process entry point. Receives (frame, detection, state) tuples and
+    renders them with cv2.imshow. `detection` is (cx, cy, size) or None.
+    `state` is a (x, y, z, yaw) tuple. A None message is the shutdown sentinel.
     """
+    import cv2 as _cv2  # re-import inside child so spawn-based start works
+    import numpy as _np
 
-    def __init__(self, cam: 'UdpVideoThread', ctrl=None):
-        super().__init__(daemon=True, name='FpvViewerThread')
-        self._cam = cam
-        self._ctrl = ctrl
-        self._running = False
-
-    def start(self):
-        self._running = True
-        super().start()
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        win = 'Crazyflie FPV'
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE)
-        last = None
-        period = 1.0 / max(1.0, FPV_RATE_HZ)
-        next_t = time.time()
-        while self._running:
-            # Throttle the loop with time.sleep (releases the GIL cleanly so
-            # the UDP receiver thread can keep up with incoming packets).
-            now = time.time()
-            if now < next_t:
-                time.sleep(min(period, next_t - now))
-                # Still pump the GUI event queue so the window stays responsive
-                cv2.waitKey(1)
-                continue
-            next_t = now + period
-
-            frame = self._cam.latest_frame
-            if frame is None or frame is last:
-                cv2.waitKey(1)
-                continue
-            last = frame
-            disp = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
-            # Crosshair
-            cv2.line(disp, (CAM_WIDTH // 2, 0), (CAM_WIDTH // 2, CAM_HEIGHT),
-                     (60, 60, 60), 1)
-            cv2.line(disp, (0, CAM_HEIGHT // 2), (CAM_WIDTH, CAM_HEIGHT // 2),
-                     (60, 60, 60), 1)
-
-            # Read the controller's cached detection — no CV work here.
-            det = self._ctrl.last_detection if self._ctrl is not None else None
-            if det is not None:
-                rcx, rcy, size = det
-                color = (0, 255, 0) if size >= GATE_SIZE_CLOSE else (0, 200, 255)
-                half = int(size / 2)
-                cv2.rectangle(disp,
-                              (int(rcx) - half, int(rcy) - half),
-                              (int(rcx) + half, int(rcy) + half),
-                              color, 2)
-                cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
-                               cv2.MARKER_CROSS, 14, 2)
-                cv2.putText(disp,
-                            f'cx={rcx:.0f} cy={rcy:.0f} size={size:.0f}',
-                            (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            else:
-                cv2.putText(disp, 'no gate', (5, 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-            # Pose overlay
-            if self._ctrl is not None:
-                s = self._ctrl._state
-                cv2.putText(disp,
-                            f"x={s['x']:+.2f} y={s['y']:+.2f} z={s['z']:.2f} yaw={s['yaw']:+.0f}",
-                            (5, CAM_HEIGHT - 6), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.42, (255, 255, 255), 1)
-
-            if FPV_SCALE != 1:
-                disp = cv2.resize(disp,
-                                  (CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE),
-                                  interpolation=cv2.INTER_NEAREST)
-            cv2.imshow(win, disp)
-            if (cv2.waitKey(1) & 0xFF) == ord('Q'):  # capital Q only — lowercase q is emergency stop
-                break
+    win = 'Crazyflie FPV'
+    _cv2.namedWindow(win, _cv2.WINDOW_NORMAL)
+    _cv2.resizeWindow(win, cam_w * scale, cam_h * scale)
+    while True:
         try:
-            cv2.destroyWindow(win)
+            msg = q.get(timeout=0.5)
         except Exception:
-            pass
+            # No frame in 500 ms — still pump the GUI so the window is responsive
+            if (_cv2.waitKey(1) & 0xFF) == ord('Q'):
+                break
+            continue
+        if msg is None:
+            break
+        frame, det, state = msg
+        disp = frame.copy() if frame.ndim == 3 else _cv2.cvtColor(frame, _cv2.COLOR_GRAY2BGR)
+
+        # Crosshair
+        _cv2.line(disp, (cam_w // 2, 0), (cam_w // 2, cam_h), (60, 60, 60), 1)
+        _cv2.line(disp, (0, cam_h // 2), (cam_w, cam_h // 2), (60, 60, 60), 1)
+
+        if det is not None:
+            rcx, rcy, size = det
+            color = (0, 255, 0) if size >= gate_size_close else (0, 200, 255)
+            half = int(size / 2)
+            _cv2.rectangle(disp,
+                           (int(rcx) - half, int(rcy) - half),
+                           (int(rcx) + half, int(rcy) + half),
+                           color, 2)
+            _cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
+                            _cv2.MARKER_CROSS, 14, 2)
+            _cv2.putText(disp, f'cx={rcx:.0f} cy={rcy:.0f} size={size:.0f}',
+                         (5, 18), _cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        else:
+            _cv2.putText(disp, 'no gate', (5, 18),
+                         _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        if state is not None:
+            sx, sy, sz, syaw = state
+            _cv2.putText(disp,
+                         f"x={sx:+.2f} y={sy:+.2f} z={sz:.2f} yaw={syaw:+.0f}",
+                         (5, cam_h - 6), _cv2.FONT_HERSHEY_SIMPLEX,
+                         0.42, (255, 255, 255), 1)
+
+        if scale != 1:
+            disp = _cv2.resize(disp, (cam_w * scale, cam_h * scale),
+                               interpolation=_cv2.INTER_NEAREST)
+        _cv2.imshow(win, disp)
+        if (_cv2.waitKey(1) & 0xFF) == ord('Q'):
+            break
+    try:
+        _cv2.destroyAllWindows()
+    except Exception:
+        pass
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -505,13 +485,15 @@ class GateController:
         self._ema_cy            = None
         self._ema_size          = None
 
-        # Shared with FpvViewerThread so it can draw the overlay without
-        # re-running the detection pipeline (cuts CV load roughly in half and
-        # stops the UDP recv thread from being GIL-starved mid-flight).
-        # 'hit'  → (cx, cy, size) of the last successful detection
-        # 'miss' → True when the most recent fresh frame had no gate
+        # Shared with FPV viewer (separate process). last_detection is
+        # (cx, cy, size) of the most recent successful detection, or None.
         self.last_detection = None
         self.last_detection_miss = False
+
+        # Optional multiprocessing.Queue (maxsize=1) the FPV process reads
+        # from. Wire it in from main; we push (frame, detection, state) here
+        # whenever we process a fresh frame, dropping silently if full.
+        self._fpv_q = None
 
         # Log config is set up after connection (called from main)
         lg = LogConfig(name='State', period_in_ms=100)
@@ -550,6 +532,7 @@ class GateController:
         if cx is None:
             self.last_detection = None
             self.last_detection_miss = True
+            self._push_fpv(frame, None)
             return None, None, None, 'new_miss'
 
         # EMA smoothing — damp single-frame outliers (one wild detection out
@@ -563,7 +546,20 @@ class GateController:
             self._ema_size = a * size + (1 - a) * self._ema_size
         self.last_detection = (self._ema_cx, self._ema_cy, self._ema_size)
         self.last_detection_miss = False
+        self._push_fpv(frame, self.last_detection)
         return self._ema_cx, self._ema_cy, self._ema_size, 'new_hit'
+
+    def _push_fpv(self, frame, det):
+        """Non-blocking send to the FPV viewer process. Drops if the queue is
+        full so the control loop never waits on the GUI."""
+        if self._fpv_q is None:
+            return
+        state = (self._state['x'], self._state['y'],
+                 self._state['z'], self._state['yaw'])
+        try:
+            self._fpv_q.put_nowait((frame, det, state))
+        except queue_mod.Full:
+            pass
 
     def _reset_detection_filter(self):
         """Clear EMA state — call when entering a new visual-servo phase
@@ -707,15 +703,12 @@ class GateController:
             if status == 'new_hit':
                 hits += 1
                 last = (cx, cy, size)
-                print(f'  [LOCK] tick={tick:3d} HIT   cx={cx:6.1f} cy={cy:6.1f} '
-                      f'size={size:5.1f}px total_hits={hits}')
                 # Early-exit as soon as we have enough hits (no need to wait out
                 # the full window — the lock is "less strict" now).
                 if hits >= LOCK_MIN_HITS:
                     break
             elif status == 'new_miss':
                 misses += 1
-                print(f'  [LOCK] tick={tick:3d} MISS (total_hits={hits})')
             else:
                 stale += 1
             self._safe_hover(z=CRUISE_ALT)
@@ -785,8 +778,6 @@ class GateController:
 
             if status == 'new_miss':
                 age = time.time() - t_last_hit
-                print(f'  [APPROACH] tick={tick:4d} fresh MISS (age={age:.2f}s) '
-                      f'coast vx={last_vx:.2f} vy={last_vy:+.2f} z={target_z:.2f}')
                 if age > LOST_TIMEOUT_S:
                     print(f'  [APPROACH] gate lost {age:.2f}s → SEARCH '
                           f'(approach lasted {time.time() - t_start:.1f}s, '
@@ -837,14 +828,16 @@ class GateController:
                               CRUISE_ALT - MAX_VZ_DELTA,
                               CRUISE_ALT + MAX_VZ_DELTA)
 
-            sx = 'OK' if size_ok else '--'
-            ax = 'OK' if align_ok else '--'
-            fps = frames_seen / max(time.time() - t_start, 0.001)
-            print(f'  [IBVS] t={tick:4d} f={frames_seen} fps={fps:.1f}  '
-                  f'cx={cx:6.1f} cy={cy:6.1f} sz={size:5.1f}px '
-                  f'[{sx}|{ax}]  ex={e_x:+5.0f} ey={e_y:+5.0f} ez={e_z:+5.0f}  '
-                  f'align={align_factor:.2f}  vx={v_forward:.3f} vy={v_strafe:+.3f} '
-                  f'z={target_z:.2f}  pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f})')
+            # Throttle to ~1 Hz so console I/O doesn't starve UDP recv thread
+            if tick % 10 == 0:
+                sx = 'OK' if size_ok else '--'
+                ax = 'OK' if align_ok else '--'
+                fps = frames_seen / max(time.time() - t_start, 0.001)
+                print(f'  [IBVS] t={tick:4d} f={frames_seen} fps={fps:.1f}  '
+                      f'cx={cx:6.1f} cy={cy:6.1f} sz={size:5.1f}px '
+                      f'[{sx}|{ax}]  ex={e_x:+5.0f} ey={e_y:+5.0f} ez={e_z:+5.0f}  '
+                      f'align={align_factor:.2f}  vx={v_forward:.3f} vy={v_strafe:+.3f} '
+                      f'z={target_z:.2f}  pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f})')
 
             # ── Step 5: cache + send command ─────────────────────────────────
             # Cache for stale-tick re-send (no fresh frame → coast on last cmd)
@@ -886,8 +879,6 @@ class GateController:
                                  CRUISE_ALT - MAX_VZ_DELTA,
                                  CRUISE_ALT + MAX_VZ_DELTA)
                 last_vy = v_strafe
-                print(f'  [TRANSIT] t={tick:3d} SEEN  cx={cx:6.1f} cy={cy:6.1f} '
-                      f'ex={e_x:+5.0f} ey={e_y:+5.0f} vy={v_strafe:+.3f} z={target_z:.2f}')
                 self._safe_hover(vx=TRANSIT_VX, vy=v_strafe, z=target_z)
             elif status == 'new_miss':
                 miss += 1
@@ -1387,16 +1378,21 @@ if __name__ == '__main__':
         cf.close_link()
         exit(1)
 
-    # Live FPV window with detection overlay
-    fpv = None
+    # Live FPV window — runs in a SEPARATE PROCESS so its GUI work cannot
+    # GIL-stall the UDP recv thread or the control loop.
+    fpv_proc = None
+    fpv_q = None
     if FPV_ENABLED and cam is not None:
-        fpv = FpvViewerThread(cam, ctrl)
-        fpv.start()
-        print('FPV viewer started')
+        fpv_q = mp.Queue(maxsize=1)   # latest-wins; controller drops if full
+        ctrl._fpv_q = fpv_q
+        fpv_proc = mp.Process(
+            target=_fpv_viewer_process,
+            args=(fpv_q, FPV_SCALE, CAM_WIDTH, CAM_HEIGHT, GATE_SIZE_CLOSE),
+            daemon=True, name='FpvViewerProc')
+        fpv_proc.start()
+        print(f'FPV viewer process started (pid={fpv_proc.pid})')
 
     # Emergency stop listener
-    # threading.Thread(target=emergency_stop_listener,args=(ctrl, cam, cf), daemon=True).start()
-    # emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
     emergency_stop_thread = threading.Thread(target=emergency_stop_listener, args=(ctrl, cam, cf), daemon=True)
     emergency_stop_thread.start()
 
@@ -1406,8 +1402,13 @@ if __name__ == '__main__':
         else:
             ctrl.run_fast_lap(GATE_POSITIONS, N_LAPS)
     finally:
-        if fpv is not None:
-            fpv.stop()
+        if fpv_q is not None:
+            try:
+                fpv_q.put_nowait(None)  # graceful shutdown sentinel
+            except Exception:
+                pass
+        if fpv_proc is not None:
+            fpv_proc.join(timeout=1.0)
         if cam is not None:
             cam.stop()
         cf.close_link()
