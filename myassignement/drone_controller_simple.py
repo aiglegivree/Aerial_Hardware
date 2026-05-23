@@ -224,17 +224,33 @@ class UdpVideoThread(threading.Thread):
             return self._frame
 
     def run(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
-        sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
+            sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
+            print(f'[UDP] bound :{UDP_LOCAL_PORT}, sent START to {UDP_AIDECK_IP}:{UDP_AIDECK_PORT}')
+        except Exception as e:
+            print(f'[UDP] socket setup failed: {e!r}')
+            return
 
         buffer = bytearray()
         expected_size = 0
         receiving = False
+        pkt_count = 0
+        last_log = time.time()
 
         while True:
             data, _ = sock.recvfrom(2048)
+            pkt_count += 1
+            if pkt_count == 1:
+                print(f'[UDP] first packet received ({len(data)} bytes)')
+            now = time.time()
+            if now - last_log > 2.0:
+                print(f'[UDP] {pkt_count} packets received in last {now - last_log:.1f}s '
+                      f'(receiving={receiving}, buf={len(buffer)}/{expected_size})')
+                last_log = now
+                pkt_count = 0
             if len(data) < CPX_HEADER_SIZE:
                 continue
             payload = data[CPX_HEADER_SIZE:]
@@ -1358,6 +1374,14 @@ def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazy
 
 if __name__ == '__main__':
     assert MISSION in ('vision', 'position'), "MISSION must be 'vision' or 'position'"
+    # Start the camera thread FIRST (matches FPV example ordering) so the
+    # AI-deck receives START_MAGIC and begins streaming while the Crazyradio
+    # link is still being established.
+    cam = None
+    if MISSION == 'vision':
+        cam = UdpVideoThread()
+        cam.start()
+
     cflib.crtp.init_drivers()
 
     # Single Crazyflie instance over Crazyradio (control + logs)
@@ -1386,11 +1410,7 @@ if __name__ == '__main__':
         print('Connection timed out — exiting')
         exit(1)
 
-    # The camera is only needed for the vision mission.
-    cam = None
-    if MISSION == 'vision':
-        cam = UdpVideoThread()
-        cam.start()
+    if cam is not None:
         print('Waiting for first camera frame...')
         while cam.latest_frame is None:
             time.sleep(0.05)
