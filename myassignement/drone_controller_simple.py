@@ -87,7 +87,7 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
 # ── FPV viewer ────────────────────────────────────────────────────────────────
-FPV_ENABLED  = False  # show live camera window with detection overlay
+FPV_ENABLED  = True   # show live camera window with detection overlay
 FPV_SCALE    = 2      # upscale factor for the display window
 FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
                        # (kept low so the UDP receiver thread isn't GIL-starved
@@ -140,8 +140,8 @@ SEARCH_TIMEOUT  = 15.0  # s — double yaw rate after this
 # detect, then commit to APPROACH. Lock requires LOCK_MIN_HITS consecutive
 # detections on UNIQUE frames to filter out single-frame flukes. Tuned for
 # the AI-deck's real ~2–3 fps: 2 confirmed fresh detections in ~2.5 s.
-LOCK_DURATION   = 2.5   # s — hover-and-confirm window
-LOCK_MIN_HITS   = 2     # consecutive UNIQUE-FRAME detections required
+LOCK_DURATION   = 1.0   # s — hover-and-confirm window
+LOCK_MIN_HITS   = 1     # unique-frame detections required (non-consecutive)
 
 # Lost-detection timeout is wall-clock based (not tick-based) so a slow
 # camera doesn't make us bail prematurely. With ~3 fps, 1.5 s = ~4–5 frames.
@@ -743,13 +743,12 @@ class GateController:
         SEARCH).
         """
         print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection '
-              f'(need {LOCK_MIN_HITS} consecutive UNIQUE-FRAME hits)')
+              f'(need {LOCK_MIN_HITS} total UNIQUE-FRAME hits, non-consecutive)')
         # Don't reset EMA here — keep refining the smoothed pose from search.
         t_end = time.time() + LOCK_DURATION
         hits = 0
         misses = 0
         stale = 0
-        best_streak = 0
         last = None
         tick = 0
         while time.time() < t_end and not self._stop:
@@ -757,29 +756,28 @@ class GateController:
             tick += 1
             if status == 'new_hit':
                 hits += 1
-                best_streak = max(best_streak, hits)
                 last = (cx, cy, size)
                 print(f'  [LOCK] tick={tick:3d} HIT   cx={cx:6.1f} cy={cy:6.1f} '
-                      f'size={size:5.1f}px streak={hits}')
+                      f'size={size:5.1f}px total_hits={hits}')
+                # Early-exit as soon as we have enough hits (no need to wait out
+                # the full window — the lock is "less strict" now).
+                if hits >= LOCK_MIN_HITS:
+                    break
             elif status == 'new_miss':
-                if hits > 0:
-                    print(f'  [LOCK] tick={tick:3d} MISS  (streak broken at {hits})')
-                else:
-                    print(f'  [LOCK] tick={tick:3d} MISS')
                 misses += 1
-                hits = 0
+                print(f'  [LOCK] tick={tick:3d} MISS (total_hits={hits})')
             else:
                 stale += 1
             self._safe_hover(z=CRUISE_ALT)
             time.sleep(0.1)
 
-        unique = (best_streak if best_streak > hits else hits) + misses
-        if best_streak >= LOCK_MIN_HITS and last is not None:
-            print(f'  [LOCK] CONFIRMED  best_streak={best_streak} '
-                  f'unique_frames={unique} stale_ticks={stale} '
+        unique = hits + misses
+        if hits >= LOCK_MIN_HITS and last is not None:
+            print(f'  [LOCK] CONFIRMED  hits={hits} unique_frames={unique} '
+                  f'stale_ticks={stale} '
                   f'last(cx={last[0]:.0f},size={last[2]:.0f}px) → APPROACH')
             return True
-        print(f'  [LOCK] FAILED  best_streak={best_streak} (<{LOCK_MIN_HITS}) '
+        print(f'  [LOCK] FAILED  hits={hits} (<{LOCK_MIN_HITS}) '
               f'unique_frames={unique} stale_ticks={stale} → SEARCH')
         return False
 
