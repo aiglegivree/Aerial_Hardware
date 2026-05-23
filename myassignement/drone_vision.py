@@ -63,7 +63,7 @@ CAM_HEIGHT = 244
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
-MIN_JPEG_BYTES   = 5000
+MIN_JPEG_BYTES   = 1000
 
 # Frame centre — used by the camera thread to compute pixel errors
 _CX_MID = CAM_WIDTH  / 2.0   # 162 px
@@ -71,7 +71,7 @@ _CY_MID = CAM_HEIGHT / 2.0   # 122 px
 
 # ── FPV viewer ─────────────────────────────────────────────────────────────────
 
-FPV_ENABLED = False
+FPV_ENABLED = True
 FPV_SCALE   = 2
 FPV_RATE_HZ = 10
 
