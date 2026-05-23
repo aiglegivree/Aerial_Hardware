@@ -97,7 +97,7 @@ FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
-MIN_JPEG_BYTES   = 5000
+MIN_JPEG_BYTES   = 1000
 
 # ── arena bounds (Lighthouse world frame) ──────────────────────────────────────
 ARENA_X_MIN = -1.0   # m — back wall
@@ -238,24 +238,19 @@ class UdpVideoThread(threading.Thread):
         expected_size = 0
         receiving = False
         pkt_count = 0
-        hdr_count = 0
-        frame_count = 0
-        decode_fail = 0
         last_log = time.time()
 
         while True:
             data, _ = sock.recvfrom(2048)
             pkt_count += 1
             if pkt_count == 1:
-                print(f'[UDP] first packet received ({len(data)} bytes), '
-                      f'first16={data[:16].hex()}')
+                print(f'[UDP] first packet received ({len(data)} bytes)')
             now = time.time()
             if now - last_log > 2.0:
-                print(f'[UDP] pkts={pkt_count} hdrs={hdr_count} frames={frame_count} '
-                      f'decode_fail={decode_fail} '
-                      f'(receiving={receiving} buf={len(buffer)}/{expected_size})')
+                print(f'[UDP] {pkt_count} packets received in last {now - last_log:.1f}s '
+                      f'(receiving={receiving}, buf={len(buffer)}/{expected_size})')
                 last_log = now
-                pkt_count = hdr_count = frame_count = decode_fail = 0
+                pkt_count = 0
             if len(data) < CPX_HEADER_SIZE:
                 continue
             payload = data[CPX_HEADER_SIZE:]
@@ -264,7 +259,6 @@ class UdpVideoThread(threading.Thread):
                 _, w, h, _, _, size = struct.unpack(
                     '<BHHBBI', payload[:IMG_HEADER_SIZE])
                 if w == CAM_WIDTH and h == CAM_HEIGHT and 0 < size < 65536:
-                    hdr_count += 1
                     expected_size = size
                     buffer = bytearray()
                     receiving = True
@@ -276,15 +270,7 @@ class UdpVideoThread(threading.Thread):
             buffer.extend(payload)
 
             if len(buffer) >= expected_size:
-                before = self._frame is not None
                 self._decode_and_store(buffer)
-                if (self._frame is not None) and not before:
-                    print(f'[UDP] first frame decoded! shape={self._frame.shape} '
-                          f'dtype={self._frame.dtype}')
-                if self._frame is not None:
-                    frame_count += 1
-                else:
-                    decode_fail += 1
                 receiving = False
 
     def _decode_and_store(self, buffer):
@@ -298,7 +284,7 @@ class UdpVideoThread(threading.Thread):
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
+        if img is None:# or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
             return
         # No colour-channel swap: get_gate_detection expects BGR (or gray).
         # The FPV example swaps BGR→RGB only for Qt display, which we don't need.
