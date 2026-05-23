@@ -256,11 +256,31 @@ class UdpVideoThread(threading.Thread):
         """Pre-computed Detection from the most recent frame, or None."""
         with self._lock:
             return self._detection
+        
+    def _vision_loop(self):
+        """Runs purely in the background. Processes the newest frame, drops older ones."""
+        last_frame = None
+        while self._running:
+            frame = self.latest_frame
+            
+            # If no new frame has arrived yet, wait briefly
+            if frame is None or frame is last_frame:
+                time.sleep(0.01)
+                continue
+                
+            last_frame = frame
+            det = _detect_gate(frame)  # Heavy math happens here now!
+            
+            with self._lock:
+                self._detection = det
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
+        
+        # CRITICAL: Added a timeout so the thread never hangs if Wi-Fi drops
+        sock.settimeout(0.5)
         sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
 
         buffer        = bytearray()
@@ -270,6 +290,10 @@ class UdpVideoThread(threading.Thread):
         while self._running:
             try:
                 data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                # If the AI-deck pauses, resend the wake-up packet
+                sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
+                continue
             except Exception:
                 time.sleep(0.01)
                 continue
@@ -294,10 +318,9 @@ class UdpVideoThread(threading.Thread):
             if len(buffer) >= expected_size:
                 frame = self._decode_frame(buffer)
                 if frame is not None:
-                    det = _detect_gate(frame)   # detection happens here
+                    # Just save the frame. The vision thread will pick it up instantly.
                     with self._lock:
-                        self._frame     = frame
-                        self._detection = det
+                        self._frame = frame
                 receiving = False
 
     def _decode_frame(self, buffer):
@@ -311,8 +334,6 @@ class UdpVideoThread(threading.Thread):
         jpeg = np.frombuffer(buffer, np.uint8, count=jpeg_len, offset=soi)
         with _muted_stderr():
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
-        # if img is None or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
-        #     return None
         if img.ndim == 2:
             return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         return img
@@ -716,7 +737,6 @@ if __name__ == '__main__':
     cam.start()
     print('Waiting for first camera frame...')
     while cam.latest_frame is None:
-    
         time.sleep(0.05)
     print('Camera ready')
 
