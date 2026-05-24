@@ -537,8 +537,9 @@ class GateController:
         self._gate_yaw = yaw_r
         self._gate_z   = s['z']
         self._app_x,  self._app_y  = s['x'], s['y']
-        self._mid_x,  self._mid_y  = _clamp_to_arena(s['x'] + 0.4 * fw[0],
-                                                     s['y'] + 0.4 * fw[1])
+        mid_d = EXIT_DIST / 2.0
+        self._mid_x,  self._mid_y  = _clamp_to_arena(s['x'] + mid_d * fw[0],
+                                                     s['y'] + mid_d * fw[1])
         self._exit_x, self._exit_y = _clamp_to_arena(s['x'] + EXIT_DIST * fw[0],
                                                      s['y'] + EXIT_DIST * fw[1])
         self._travel_phase = 1
@@ -772,32 +773,28 @@ class GateController:
 
 # ── emergency stop ─────────────────────────────────────────────────────────────
 
-def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazyflie):
-    """ESC → controlled landing; Q → immediate motor kill."""
+def emergency_stop_listener(ctrl: GateController):
+    """ESC → request controlled land (main thread handles it).
+       Q   → request immediate motor kill (also fired here, then main thread cleans up).
+
+    Only writes ctrl._stop and (on Q) one stop_setpoint. Landing and link
+    teardown stay on the main thread to avoid racing cflib from two threads.
+    """
 
     def on_press(key):
         if key == keyboard.Key.esc:
-            print('\n[EMERGENCY STOP] landing')
+            print('\n[EMERGENCY STOP] requesting controlled land')
             ctrl._stop = True
-            try:
-                ctrl.land()
-            except Exception as e:
-                print(f'Land failed ({e}) — cutting motors')
-                ctrl._stop_motors()
-            finally:
-                if cam is not None:
-                    cam.stop()
-                cf.close_link()
             return False
 
         try:
             if key.char == 'q':
-                print('\n[EMERGENCY STOP] cutting motors immediately')
+                print('\n[EMERGENCY STOP] cutting motors')
                 ctrl._stop = True
-                ctrl._stop_motors()
-                if cam is not None:
-                    cam.stop()
-                cf.close_link()
+                try:
+                    ctrl._stop_motors()
+                except Exception:
+                    pass
                 return False
         except AttributeError:
             pass
@@ -859,7 +856,7 @@ if __name__ == '__main__':
 
     threading.Thread(
         target=emergency_stop_listener,
-        args=(ctrl, cam, cf),
+        args=(ctrl,),
         daemon=True,
     ).start()
 
