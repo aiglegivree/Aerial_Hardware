@@ -657,6 +657,7 @@ class GateController:
 
         self.is_connected = False
         self._stop        = False
+        self._killed      = False   # set by Q: motors already cut, skip land()
         self._state       = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0}
 
         # Log config is set up after connection (called from main)
@@ -1006,14 +1007,14 @@ class GateController:
         finally:
             save_running[0] = False
             print(f'[FRAME SAVER] stopped — {frame_idx[0]} frames saved to gate_frames/')
-            # Always attempt a controlled landing, whatever happened above.
-            # _stop_motors() is NOT called here — land() does a gradual descent
-            # and only cuts motors at the end, so the drone doesn't just drop.
-            try:
-                self.land()
-            except Exception as e:
-                print(f'Land failed ({e}) — cutting motors')
-                self._stop_motors()
+            if self._killed:
+                print('[MISSION] motors already cut — skipping land')
+            else:
+                try:
+                    self.land()
+                except Exception as e:
+                    print(f'Land failed ({e}) — cutting motors')
+                    self._stop_motors()
 
     # =========================================================================
     # PART 2 — position-based mission (known gate coordinates)
@@ -1148,11 +1149,14 @@ class GateController:
             print(f'\nUnhandled exception during fast lap: {e} — landing now')
 
         finally:
-            try:
-                self.land()
-            except Exception as e:
-                print(f'Land failed ({e}) — cutting motors')
-                self._stop_motors()
+            if self._killed:
+                print('[MISSION] motors already cut — skipping land')
+            else:
+                try:
+                    self.land()
+                except Exception as e:
+                    print(f'Land failed ({e}) — cutting motors')
+                    self._stop_motors()
 
 
 # ── emergency stop ─────────────────────────────────────────────────────────────
@@ -1173,73 +1177,31 @@ def emergency_stop_callback(cf):
         listener.join()
 
 def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazyflie):
-    """Press 'q' for emergency stop.
-    Attempts a controlled landing first; if that fails, cuts motors immediately.
-    Press 'q' a second time to skip the landing and cut motors instantly.
     """
-    #stop_count = [0]
+    ESC → controlled landing: sets _stop so the mission loop exits cleanly
+          and its finally block handles the landing.  Nothing else — avoids
+          a race where two threads both call land() at the same time.
 
+    Q   → immediate motor cut: calls _stop_motors() right away (safe from
+          any thread), then sets _stop so the mission loop exits.  The
+          finally block will try land() afterwards, which is harmless since
+          the drone is already down.
+
+    No land() or close_link() is called here — those are handled by the
+    mission finally block and the __main__ finally block respectively.
+    """
     def on_press(key):
-        # try:
-        #     if key.char != 'q':
-        #         return
-        # except AttributeError:
-        #     return
-
-        # stop_count[0] += 1
-        # ctrl._stop = True
-
-        # if stop_count[0] == 1:
-        #     print('\n[EMERGENCY STOP] landing — press Q again to cut motors immediately')
-        #     try:
-        #         ctrl.land()
-        #     except Exception as e:
-        #         print(f'Land failed ({e}) — cutting motors')
-        #         ctrl._stop_motors()
-        #     finally:
-        #         if cam is not None:
-        #             cam.stop()
-        #         cf.close_link()
-        #     return False
-
-        # elif stop_count[0] >= 2:
-        #     print('\n[EMERGENCY STOP] cutting motors immediately')
-        #     ctrl._stop_motors()
-        #     if cam is not None:
-        #         cam.stop()
-        #     cf.close_link()
-        #     return False
-        # ESC → controlled landing
         if key == keyboard.Key.esc:
-            print('\n[EMERGENCY STOP] landing')
-
+            print('\n[STOP] ESC — stopping mission (controlled landing)')
             ctrl._stop = True
+            return False   # stop the listener; mission loop handles the rest
 
-            try:
-                ctrl.land()
-            except Exception as e:
-                print(f'Land failed ({e}) — cutting motors')
-                ctrl._stop_motors()
-            finally:
-                if cam is not None:
-                    cam.stop()
-                cf.close_link()
-
-            return False
-
-        # Q → immediate kill
         try:
             if key.char == 'q':
-                print('\n[EMERGENCY STOP] cutting motors immediately')
-
-                ctrl._stop = True
+                print('\n[STOP] Q — cutting motors immediately')
+                ctrl._stop   = True
+                ctrl._killed = True   # tell finally blocks to skip land()
                 ctrl._stop_motors()
-
-                if cam is not None:
-                    cam.stop()
-
-                cf.close_link()
-
                 return False
         except AttributeError:
             pass
