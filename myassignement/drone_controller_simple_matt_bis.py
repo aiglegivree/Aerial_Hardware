@@ -24,10 +24,9 @@ Architecture:
                      state from the log callback, reads camera detections
                      from UdpVideoThread.
 
-Part 1 — visual servoing (no world-frame gate position needed):
-  lateral error  cx - frame_cx          → vy   (strafe)
-  vertical error cy_mid - cy            → Δz   (altitude nudge)
-  size gap       GATE_SIZE_CLOSE - size → vx   (forward speed)
+Part 1 — triangulation-based gate finding:
+    two camera views + drone pose estimate → triangulate gate centre and yaw,
+    then fly approach / middle / exit waypoints through the gate.
 
 Part 2 — raw waypoint streaming (Lighthouse world frame):
   Build one waypoint list per lap (start → pre-gate, gate centre, post-gate
@@ -47,7 +46,9 @@ Press 'q' at any time for emergency stop.
 import contextlib
 import logging
 import math
+import multiprocessing as mp
 import os
+import queue as queue_mod
 import socket
 import struct
 import time
@@ -57,12 +58,14 @@ import warnings
 import cv2
 import numpy as np
 from pynput import keyboard
+from scipy.spatial.transform import Rotation as R
 
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.utils import uri_helper
 
+from cv_detection import detect_gate
 from gate_detection import GATE_SIZE_MIN, GATE_SIZE_CLOSE, get_gate_detection
 
 warnings.filterwarnings("ignore", message=".*supervisor subsystem requires CRTP.*")
@@ -74,7 +77,7 @@ MISSION = 'vision'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoin
 
 # ── connection ─────────────────────────────────────────────────────────────────
 
-CONTROL_URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E708')
+CONTROL_URI = uri_helper.uri_from_env(default='radio://0/20/2M/E7E7E7E708')
 
 UDP_AIDECK_IP   = '192.168.4.1'
 UDP_AIDECK_PORT = 5000
@@ -87,12 +90,13 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
 # ── FPV viewer ────────────────────────────────────────────────────────────────
+# The viewer now runs in a SEPARATE PROCESS (mp.Process). It receives frames
+# over a maxsize=1 queue — when the queue is full we drop, so the control
+# loop never waits on the GUI. Because the viewer has its own GIL/interpreter,
+# its render rate is no longer coupled to the recv thread; the rate is driven
+# by the camera's natural fps (~3 fps).
 FPV_ENABLED  = True   # show live camera window with detection overlay
 FPV_SCALE    = 2      # upscale factor for the display window
-FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
-                       # (kept low so the UDP receiver thread isn't GIL-starved
-                       #  — that was causing the AI-deck stream to stall after
-                       #  the first frame)
 
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
@@ -112,6 +116,37 @@ SAFETY_MARGIN_HARD = 0.00000  # m — never fly closer than this to a wall
 CRUISE_ALT       = 1.25  # m ## The height position of the drone
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
+
+# ── triangulation mission (hardware_lap1 port) ────────────────────────────────
+
+GATE_HEIGHT_REAL = 0.40   # m
+GATE_HEIGHT_TOL  = 0.15   # m
+GATE_DIST_MIN    = 0.30   # m
+GATE_DIST_MAX    = 3.00   # m
+
+LATERAL_DIST     = 0.50   # m — baseline between the two triangulation views
+REQ_FRAMES       = 5      # fresh good detections needed at each view
+SPEED_THRESHOLD  = 0.10   # m/s — used when stateEstimate velocity is available
+APPROACH_DIST    = 0.60   # m
+EXIT_DIST        = 0.60   # m
+PASS_TOLERANCE   = 0.10   # m
+LOST_THRESHOLD   = 20     # fresh no-gate detections before retrying
+
+CIRCUIT_OFFSET       = 1.0    # m
+EXPECTED_SECTORS     = [4, 2, 0, 10, 8]
+SECTOR_TOLERANCE_DEG = 45.0
+
+R_CAM_TO_BODY = np.array([[0, 0, 1],
+                          [-1, 0, 0],
+                          [0, -1, 0]], dtype=float)
+
+FIRS_TRIANGULATION   = 'FIRS_TRIANGULATION'
+FIRST_TRIANGULATION  = FIRS_TRIANGULATION
+LATERAL_DRIFT        = 'LATERAL_DRIFT'
+SECOND_TRIANGULATION = 'SECOND_TRIANGULATION'
+COMPUTE_GATE_POS     = 'COMPUTE_GATE_POS'
+TRAVEL_TO_GATE       = 'TRAVEL_TO_GATE'
+DONE                 = 'DONE'
 
 # IBVS gains — tune these on the real drone
 # (Conservative: user said "slow is fine"; prefer reliable centering over speed.)
@@ -213,6 +248,7 @@ class UdpVideoThread(threading.Thread):
         super().__init__(daemon=True, name='UdpVideoThread')
         self._lock = threading.Lock()
         self._frame = None
+        self._frame_ts = 0.0
 
     def stop(self):
         # Kept for API compatibility; the daemon thread exits with the process.
@@ -222,6 +258,11 @@ class UdpVideoThread(threading.Thread):
     def latest_frame(self):
         with self._lock:
             return self._frame
+
+    @property
+    def latest_frame_with_ts(self):
+        with self._lock:
+            return self._frame, self._frame_ts
 
     def run(self):
         try:
@@ -286,105 +327,83 @@ class UdpVideoThread(threading.Thread):
             img = cv2.imdecode(jpeg, cv2.IMREAD_UNCHANGED)
         if img is None:# or img.shape[:2] != (CAM_HEIGHT, CAM_WIDTH):
             return
-        # No colour-channel swap: get_gate_detection expects BGR (or gray).
-        # The FPV example swaps BGR→RGB only for Qt display, which we don't need.
+        if img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         with self._lock:
             self._frame = img
+            self._frame_ts = time.time()
 
 
-# ── FPV viewer thread ─────────────────────────────────────────────────────────
+# ── FPV viewer (separate process) ────────────────────────────────────────────
+#
+# Runs in its OWN OS process via multiprocessing.Process so its cv2.imshow,
+# Qt event loop, drawing, etc. all happen with a separate GIL and a separate
+# interpreter. Nothing it does can stall the UDP recv thread or the control
+# loop in the parent process. We communicate over a maxsize=1 queue and drop
+# frames if the viewer is behind — the viewer is purely cosmetic.
 
-class FpvViewerThread(threading.Thread):
+def _fpv_viewer_process(q, scale, cam_w, cam_h, gate_size_close):
     """
-    Live FPV window. Polls the camera's latest frame, reads the controller's
-    LAST detection (does NOT re-run the detector — that work happens once per
-    frame in the control loop), and overlays a marker. Press capital 'Q'
-    inside the window to close it (mission keeps running; lowercase 'q' is
-    the emergency stop, handled by the pynput listener).
+    Child-process entry point. Receives (frame, detection, state) tuples and
+    renders them with cv2.imshow. `detection` is (cx, cy, size) or None.
+    `state` is a (x, y, z, yaw) tuple. A None message is the shutdown sentinel.
     """
+    import cv2 as _cv2  # re-import inside child so spawn-based start works
+    import numpy as _np
 
-    def __init__(self, cam: 'UdpVideoThread', ctrl=None):
-        super().__init__(daemon=True, name='FpvViewerThread')
-        self._cam = cam
-        self._ctrl = ctrl
-        self._running = False
-
-    def start(self):
-        self._running = True
-        super().start()
-
-    def stop(self):
-        self._running = False
-
-    def run(self):
-        win = 'Crazyflie FPV'
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE)
-        last = None
-        period = 1.0 / max(1.0, FPV_RATE_HZ)
-        next_t = time.time()
-        while self._running:
-            # Throttle the loop with time.sleep (releases the GIL cleanly so
-            # the UDP receiver thread can keep up with incoming packets).
-            now = time.time()
-            if now < next_t:
-                time.sleep(min(period, next_t - now))
-                # Still pump the GUI event queue so the window stays responsive
-                cv2.waitKey(1)
-                continue
-            next_t = now + period
-
-            frame = self._cam.latest_frame
-            if frame is None or frame is last:
-                cv2.waitKey(1)
-                continue
-            last = frame
-            disp = frame.copy() if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-
-            # Crosshair
-            cv2.line(disp, (CAM_WIDTH // 2, 0), (CAM_WIDTH // 2, CAM_HEIGHT),
-                     (60, 60, 60), 1)
-            cv2.line(disp, (0, CAM_HEIGHT // 2), (CAM_WIDTH, CAM_HEIGHT // 2),
-                     (60, 60, 60), 1)
-
-            # Read the controller's cached detection — no CV work here.
-            det = self._ctrl.last_detection if self._ctrl is not None else None
-            if det is not None:
-                rcx, rcy, size = det
-                color = (0, 255, 0) if size >= GATE_SIZE_CLOSE else (0, 200, 255)
-                half = int(size / 2)
-                cv2.rectangle(disp,
-                              (int(rcx) - half, int(rcy) - half),
-                              (int(rcx) + half, int(rcy) + half),
-                              color, 2)
-                cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
-                               cv2.MARKER_CROSS, 14, 2)
-                cv2.putText(disp,
-                            f'cx={rcx:.0f} cy={rcy:.0f} size={size:.0f}',
-                            (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            else:
-                cv2.putText(disp, 'no gate', (5, 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-            # Pose overlay
-            if self._ctrl is not None:
-                s = self._ctrl._state
-                cv2.putText(disp,
-                            f"x={s['x']:+.2f} y={s['y']:+.2f} z={s['z']:.2f} yaw={s['yaw']:+.0f}",
-                            (5, CAM_HEIGHT - 6), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.42, (255, 255, 255), 1)
-
-            if FPV_SCALE != 1:
-                disp = cv2.resize(disp,
-                                  (CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE),
-                                  interpolation=cv2.INTER_NEAREST)
-            cv2.imshow(win, disp)
-            if (cv2.waitKey(1) & 0xFF) == ord('Q'):  # capital Q only — lowercase q is emergency stop
-                break
+    win = 'Crazyflie FPV'
+    _cv2.namedWindow(win, _cv2.WINDOW_NORMAL)
+    _cv2.resizeWindow(win, cam_w * scale, cam_h * scale)
+    while True:
         try:
-            cv2.destroyWindow(win)
+            msg = q.get(timeout=0.5)
         except Exception:
-            pass
+            # No frame in 500 ms — still pump the GUI so the window is responsive
+            if (_cv2.waitKey(1) & 0xFF) == ord('Q'):
+                break
+            continue
+        if msg is None:
+            break
+        frame, det, state = msg
+        disp = frame.copy() if frame.ndim == 3 else _cv2.cvtColor(frame, _cv2.COLOR_GRAY2BGR)
+
+        # Crosshair
+        _cv2.line(disp, (cam_w // 2, 0), (cam_w // 2, cam_h), (60, 60, 60), 1)
+        _cv2.line(disp, (0, cam_h // 2), (cam_w, cam_h // 2), (60, 60, 60), 1)
+
+        if det is not None:
+            rcx, rcy, size = det
+            color = (0, 255, 0) if size >= gate_size_close else (0, 200, 255)
+            half = int(size / 2)
+            _cv2.rectangle(disp,
+                           (int(rcx) - half, int(rcy) - half),
+                           (int(rcx) + half, int(rcy) + half),
+                           color, 2)
+            _cv2.drawMarker(disp, (int(rcx), int(rcy)), color,
+                            _cv2.MARKER_CROSS, 14, 2)
+            _cv2.putText(disp, f'cx={rcx:.0f} cy={rcy:.0f} size={size:.0f}',
+                         (5, 18), _cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        else:
+            _cv2.putText(disp, 'no gate', (5, 18),
+                         _cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        if state is not None:
+            sx, sy, sz, syaw = state
+            _cv2.putText(disp,
+                         f"x={sx:+.2f} y={sy:+.2f} z={sz:.2f} yaw={syaw:+.0f}",
+                         (5, cam_h - 6), _cv2.FONT_HERSHEY_SIMPLEX,
+                         0.42, (255, 255, 255), 1)
+
+        if scale != 1:
+            disp = _cv2.resize(disp, (cam_w * scale, cam_h * scale),
+                               interpolation=_cv2.INTER_NEAREST)
+        _cv2.imshow(win, disp)
+        if (_cv2.waitKey(1) & 0xFF) == ord('Q'):
+            break
+    try:
+        _cv2.destroyAllWindows()
+    except Exception:
+        pass
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -496,6 +515,35 @@ class GateController:
         self.is_connected = False
         self._stop        = False
         self._state       = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0}
+        self._state['qx'] = 0.0
+        self._state['qy'] = 0.0
+        self._state['qz'] = 0.0
+        self._state['qw'] = 1.0
+
+        # Triangulation mission state.
+        self._last_frame_ts = 0.0
+        self._frames_detected = 0
+        self._lost_count = 0
+        self._travel_phase = 0
+        self._gate_count = 0
+        self._circuit_center = np.zeros(2)
+
+        self._search_yaw_deg = 0.0
+        self._search_yaw_total = 0.0
+
+        self._P = None
+        self._Q = None
+        self._r_corners = np.zeros((4, 3))
+        self._s_corners = np.zeros((4, 3))
+        self._gate_yaw = 0.0
+        self._gate_z = CRUISE_ALT
+        self._app_x = self._app_y = 0.0
+        self._mid_x = self._mid_y = 0.0
+        self._exit_x = self._exit_y = 0.0
+        self._lat_x = self._lat_y = self._lat_z = 0.0
+        self._hold_x = self._hold_y = 0.0
+        self._hold_z = CRUISE_ALT
+        self._hold_yaw = 0.0
 
         # Fresh-vs-stale detection bookkeeping. The AI-deck only delivers
         # ~2–3 fps with notable latency, so the 20 Hz control loop must
@@ -505,24 +553,36 @@ class GateController:
         self._ema_cy            = None
         self._ema_size          = None
 
-        # Shared with FpvViewerThread so it can draw the overlay without
-        # re-running the detection pipeline (cuts CV load roughly in half and
-        # stops the UDP recv thread from being GIL-starved mid-flight).
-        # 'hit'  → (cx, cy, size) of the last successful detection
-        # 'miss' → True when the most recent fresh frame had no gate
+        # Shared with FPV viewer (separate process). last_detection is
+        # (cx, cy, size) of the most recent successful detection, or None.
         self.last_detection = None
         self.last_detection_miss = False
 
+        # Optional multiprocessing.Queue (maxsize=1) the FPV process reads
+        # from. Wire it in from main; we push (frame, detection, state) here
+        # whenever we process a fresh frame, dropping silently if full.
+        self._fpv_q = None
+
+        self._log_ready = threading.Event()
+
         # Log config is set up after connection (called from main)
-        lg = LogConfig(name='State', period_in_ms=100)
-        lg.add_variable('stateEstimate.x', 'float')
-        lg.add_variable('stateEstimate.y', 'float')
-        lg.add_variable('stateEstimate.z', 'float')
-        lg.add_variable('stabilizer.yaw',  'float')
+        lg1 = LogConfig(name='StatePosYaw', period_in_ms=100)
+        lg1.add_variable('stateEstimate.x', 'float')
+        lg1.add_variable('stateEstimate.y', 'float')
+        lg1.add_variable('stateEstimate.z', 'float')
+        lg1.add_variable('stabilizer.yaw',  'float')
+        lg2 = LogConfig(name='StateQuat', period_in_ms=100)
+        lg2.add_variable('stateEstimate.qx', 'float')
+        lg2.add_variable('stateEstimate.qy', 'float')
+        lg2.add_variable('stateEstimate.qz', 'float')
+        lg2.add_variable('stateEstimate.qw', 'float')
         try:
-            self._cf.log.add_config(lg)
-            lg.data_received_cb.add_callback(self._log_cb)
-            lg.start()
+            self._cf.log.add_config(lg1)
+            lg1.data_received_cb.add_callback(self._log_cb)
+            lg1.start()
+            self._cf.log.add_config(lg2)
+            lg2.data_received_cb.add_callback(self._log_cb)
+            lg2.start()
             self.is_connected = True
         except Exception as e:
             print(f'Log setup failed: {e}')
@@ -550,6 +610,7 @@ class GateController:
         if cx is None:
             self.last_detection = None
             self.last_detection_miss = True
+            self._push_fpv(frame, None)
             return None, None, None, 'new_miss'
 
         # EMA smoothing — damp single-frame outliers (one wild detection out
@@ -563,7 +624,208 @@ class GateController:
             self._ema_size = a * size + (1 - a) * self._ema_size
         self.last_detection = (self._ema_cx, self._ema_cy, self._ema_size)
         self.last_detection_miss = False
+        self._push_fpv(frame, self.last_detection)
         return self._ema_cx, self._ema_cy, self._ema_size, 'new_hit'
+
+    def _push_fpv(self, frame, det):
+        """Non-blocking send to the FPV viewer process. Drops if the queue is
+        full so the control loop never waits on the GUI."""
+        if self._fpv_q is None:
+            return
+        state = (self._state['x'], self._state['y'],
+                 self._state['z'], self._state['yaw'])
+        try:
+            self._fpv_q.put_nowait((frame, det, state))
+        except queue_mod.Full:
+            pass
+
+    def _current_state(self):
+        return dict(self._state)
+
+    def _send(self, x, y, z, yaw_deg):
+        self._cf.commander.send_position_setpoint(x, y, z, yaw_deg)
+
+    def _hold(self):
+        self._send(self._hold_x, self._hold_y, self._hold_z, self._hold_yaw)
+
+    def _detect(self):
+        frame, ts = self._cam.latest_frame_with_ts if self._cam is not None else (None, 0.0)
+        if frame is None or ts == self._last_frame_ts:
+            return None
+        self._last_frame_ts = ts
+
+        result = detect_gate(frame)
+        if result['status'] == 'ok':
+            quad_norm = result['quad_norm']
+            cx_norm = float(np.mean(quad_norm[:, 0]))
+            return ('ok', quad_norm, cx_norm)
+        if result['status'] == 'commit_to_pass':
+            return ('commit_to_pass', None, 0.0)
+        return ('no_gate', None, 0.0)
+
+    def _corners_to_rays(self, quad_norm, s):
+        """
+        Convert undistorted normalized image corners to world-frame rays.
+
+        Input:
+        - quad_norm: (4,2) array of undistorted normalized image coordinates (xn, yn)
+          where the camera pinhole model is used and z=1 in camera frame.
+        - s: state dict with either quaternion (`qx,qy,qz,qw`) or yaw fallback.
+
+        Geometry / frames:
+        - v_cam = [xn, yn, 1] is the ray in the camera frame (pinhole model).
+        - R_CAM_TO_BODY rotates camera-frame vectors into the vehicle body frame
+          (accounts for camera mounting orientation).
+        - R_b2w rotates body-frame vectors into the world frame using the
+          vehicle attitude (quaternion or yaw fallback).
+
+        Output: array (4,3) of world-frame direction vectors (not explicitly
+        normalized here, but used downstream as directions for line intersections).
+        """
+        quat = np.array([s.get('qx', 0.0), s.get('qy', 0.0), s.get('qz', 0.0), s.get('qw', 1.0)], dtype=float)
+        if np.linalg.norm(quat) < 1e-9:
+            yaw = math.radians(s['yaw'])
+            R_b2w = np.array([[math.cos(yaw), -math.sin(yaw), 0.0],
+                              [math.sin(yaw),  math.cos(yaw), 0.0],
+                              [0.0, 0.0, 1.0]])
+        else:
+            R_b2w = R.from_quat(quat).as_matrix()
+
+        # Build world rays for each detected corner
+        rays = np.zeros((4, 3))
+        for i, (xn, yn) in enumerate(quad_norm):
+            # camera-frame direction (pinhole assumption): z=1
+            v_cam = np.array([xn, yn, 1.0])
+            # rotate: camera -> body -> world
+            rays[i] = R_b2w @ (R_CAM_TO_BODY @ v_cam)
+        return rays
+
+    def _validate_detection(self, quad_norm, s):
+        y_span = float(np.max(quad_norm[:, 1]) - np.min(quad_norm[:, 1]))
+        if y_span < 1e-4:
+            return None
+
+        est_dist = GATE_HEIGHT_REAL / y_span
+        if est_dist < GATE_DIST_MIN or est_dist > GATE_DIST_MAX:
+            return None
+
+        cx_norm = float(np.mean(quad_norm[:, 0]))
+        bearing = math.radians(s['yaw']) - math.atan2(cx_norm, 1.0)
+        est_x = s['x'] + est_dist * math.cos(bearing)
+        est_y = s['y'] + est_dist * math.sin(bearing)
+
+        angle_rad = math.atan2(est_y - self._circuit_center[1], est_x - self._circuit_center[0])
+        angle_deg = math.degrees(angle_rad)
+        clock_angle = (360 - angle_deg + 15) % 360
+        sector = EXPECTED_SECTORS[self._gate_count % len(EXPECTED_SECTORS)]
+        sector_centre = sector * 30 + 15
+        angle_diff = abs(clock_angle - sector_centre)
+        angle_diff = min(angle_diff, 360 - angle_diff)
+        if angle_diff > SECTOR_TOLERANCE_DEG:
+            return None
+
+        return est_dist, est_x, est_y
+
+    def _triangulate(self):
+        """
+        Triangulate 3D corner positions from two views.
+
+        Algorithm summary:
+        - Each corner defines two skew lines:
+            L1(λ) = P + λ * r_i   (origin P, direction r_i)
+            L2(μ) = Q + μ * s_i   (origin Q, direction s_i)
+        - Solve for λ and μ that minimize the distance between points on the
+          two lines (least-squares solve of a 3×2 linear system A [λ; μ] = Q-P
+          where A = [r_i, -s_i]). This yields the closest points F and G.
+        - Use the midpoint (F+G)/2 as the estimated 3D corner position.
+
+        Notes on conditioning and checks:
+        - If the two rays are nearly parallel the system is ill-conditioned and
+          the least-squares result will be unreliable; calling code should
+          detect inconsistent geometry (we check gate height below).
+        - After computing 4 corners we estimate the gate height by averaging
+          the vertical distances of left/right corner pairs and compare to
+          the expected `GATE_HEIGHT_REAL` with tolerance `GATE_HEIGHT_TOL`.
+
+        Returns: (corners_3d (4x3), H (3,), gate_yaw)
+        """
+        if self._P is None or self._Q is None:
+            raise ValueError('missing triangulation views')
+
+        corners_3d = np.zeros((4, 3))
+        for i in range(4):
+            # Build 3x2 matrix A = [r_i, -s_i] and solve A [lambda; mu] = Q-P
+            A = np.column_stack([self._r_corners[i], -self._s_corners[i]])
+            b = self._Q - self._P
+            # least-squares handles non-exact intersections for skew lines
+            sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+            lmbda, mu = float(sol[0]), float(sol[1])
+            F = self._P + lmbda * self._r_corners[i]
+            G = self._Q + mu * self._s_corners[i]
+            # corner is midpoint of closest-approach points
+            corners_3d[i] = (F + G) / 2.0
+
+        # Estimate gate vertical size from corner pairs and sanity-check height
+        h_left = np.linalg.norm(corners_3d[3] - corners_3d[0])
+        h_right = np.linalg.norm(corners_3d[2] - corners_3d[1])
+        gate_height = (h_left + h_right) / 2.0
+        if abs(gate_height - GATE_HEIGHT_REAL) > GATE_HEIGHT_TOL:
+            raise ValueError(
+                f'gate height {gate_height:.2f} m outside expected '
+                f'{GATE_HEIGHT_REAL - GATE_HEIGHT_TOL:.2f}–{GATE_HEIGHT_REAL + GATE_HEIGHT_TOL:.2f} m'
+            )
+
+        # Gate center and orientation (yaw) in world frame
+        H = np.mean(corners_3d, axis=0)
+        v_width = corners_3d[1] - corners_3d[0]
+        gate_yaw = math.atan2(-v_width[1], v_width[0])
+        return corners_3d, H, gate_yaw
+
+    def _set_gate_waypoints(self, H, gate_yaw, s):
+        """
+        Compute approach, mid (pass-through), and exit waypoints from gate pose.
+
+        - Ensures gate yaw points from approach->exit (flip by pi if drone is
+          currently 'in front' of the gate), then places approach point
+          `APPROACH_DIST` meters before the gate center along gate normal and
+          `EXIT_DIST` meters after the gate.
+        - Sets `_gate_z` from the triangulated gate center height.
+        """
+        drone_2d = np.array([s['x'], s['y']])
+        gate_2d = np.array([H[0], H[1]])
+        to_drone = drone_2d - gate_2d
+        forward = np.array([math.cos(gate_yaw), math.sin(gate_yaw)])
+
+        # If drone lies on the 'forward' side of the gate, flip yaw so
+        # forward points from approach toward exit (consistent waypoint order).
+        if np.dot(to_drone, forward) >= 0:
+            gate_yaw += math.pi
+
+        self._gate_yaw = gate_yaw
+        self._gate_z = H[2]
+
+        fw = np.array([math.cos(gate_yaw), math.sin(gate_yaw)])
+        self._app_x = H[0] - APPROACH_DIST * fw[0]
+        self._app_y = H[1] - APPROACH_DIST * fw[1]
+        self._mid_x = H[0]
+        self._mid_y = H[1]
+        self._exit_x = H[0] + EXIT_DIST * fw[0]
+        self._exit_y = H[1] + EXIT_DIST * fw[1]
+        self._travel_phase = 0
+
+    def _force_pass(self, s):
+        print('[COMPUTE_GATE_POS] gate fills frame — forcing straight pass')
+        yaw_rad = math.radians(s['yaw'])
+        fw = np.array([math.cos(yaw_rad), math.sin(yaw_rad)])
+        self._gate_yaw = yaw_rad
+        self._gate_z = s['z']
+        self._app_x = s['x']
+        self._app_y = s['y']
+        self._mid_x = s['x'] + 0.4 * fw[0]
+        self._mid_y = s['y'] + 0.4 * fw[1]
+        self._exit_x = s['x'] + EXIT_DIST * fw[0]
+        self._exit_y = s['y'] + EXIT_DIST * fw[1]
+        self._travel_phase = 1
 
     def _reset_detection_filter(self):
         """Clear EMA state — call when entering a new visual-servo phase
@@ -576,7 +838,17 @@ class GateController:
         self._state['x']   = data['stateEstimate.x']
         self._state['y']   = data['stateEstimate.y']
         self._state['z']   = data['stateEstimate.z']
-        self._state['yaw'] = data['stabilizer.yaw']
+        if 'stabilizer.yaw' in data:
+            self._state['yaw'] = data['stabilizer.yaw']
+        if 'stateEstimate.qx' in data:
+            self._state['qx'] = data['stateEstimate.qx']
+        if 'stateEstimate.qy' in data:
+            self._state['qy'] = data['stateEstimate.qy']
+        if 'stateEstimate.qz' in data:
+            self._state['qz'] = data['stateEstimate.qz']
+        if 'stateEstimate.qw' in data:
+            self._state['qw'] = data['stateEstimate.qw']
+        self._log_ready.set()
         # Uncomment to debug:
         # r = math.sqrt(self._state['x']**2 + self._state['y']**2)
         # print(f"x={self._state['x']:.2f}  y={self._state['y']:.2f}  "
@@ -707,15 +979,12 @@ class GateController:
             if status == 'new_hit':
                 hits += 1
                 last = (cx, cy, size)
-                print(f'  [LOCK] tick={tick:3d} HIT   cx={cx:6.1f} cy={cy:6.1f} '
-                      f'size={size:5.1f}px total_hits={hits}')
                 # Early-exit as soon as we have enough hits (no need to wait out
                 # the full window — the lock is "less strict" now).
                 if hits >= LOCK_MIN_HITS:
                     break
             elif status == 'new_miss':
                 misses += 1
-                print(f'  [LOCK] tick={tick:3d} MISS (total_hits={hits})')
             else:
                 stale += 1
             self._safe_hover(z=CRUISE_ALT)
@@ -785,8 +1054,6 @@ class GateController:
 
             if status == 'new_miss':
                 age = time.time() - t_last_hit
-                print(f'  [APPROACH] tick={tick:4d} fresh MISS (age={age:.2f}s) '
-                      f'coast vx={last_vx:.2f} vy={last_vy:+.2f} z={target_z:.2f}')
                 if age > LOST_TIMEOUT_S:
                     print(f'  [APPROACH] gate lost {age:.2f}s → SEARCH '
                           f'(approach lasted {time.time() - t_start:.1f}s, '
@@ -837,14 +1104,16 @@ class GateController:
                               CRUISE_ALT - MAX_VZ_DELTA,
                               CRUISE_ALT + MAX_VZ_DELTA)
 
-            sx = 'OK' if size_ok else '--'
-            ax = 'OK' if align_ok else '--'
-            fps = frames_seen / max(time.time() - t_start, 0.001)
-            print(f'  [IBVS] t={tick:4d} f={frames_seen} fps={fps:.1f}  '
-                  f'cx={cx:6.1f} cy={cy:6.1f} sz={size:5.1f}px '
-                  f'[{sx}|{ax}]  ex={e_x:+5.0f} ey={e_y:+5.0f} ez={e_z:+5.0f}  '
-                  f'align={align_factor:.2f}  vx={v_forward:.3f} vy={v_strafe:+.3f} '
-                  f'z={target_z:.2f}  pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f})')
+            # Throttle to ~1 Hz so console I/O doesn't starve UDP recv thread
+            if tick % 10 == 0:
+                sx = 'OK' if size_ok else '--'
+                ax = 'OK' if align_ok else '--'
+                fps = frames_seen / max(time.time() - t_start, 0.001)
+                print(f'  [IBVS] t={tick:4d} f={frames_seen} fps={fps:.1f}  '
+                      f'cx={cx:6.1f} cy={cy:6.1f} sz={size:5.1f}px '
+                      f'[{sx}|{ax}]  ex={e_x:+5.0f} ey={e_y:+5.0f} ez={e_z:+5.0f}  '
+                      f'align={align_factor:.2f}  vx={v_forward:.3f} vy={v_strafe:+.3f} '
+                      f'z={target_z:.2f}  pos=({self._state["x"]:+.2f},{self._state["y"]:+.2f})')
 
             # ── Step 5: cache + send command ─────────────────────────────────
             # Cache for stale-tick re-send (no fresh frame → coast on last cmd)
@@ -886,8 +1155,6 @@ class GateController:
                                  CRUISE_ALT - MAX_VZ_DELTA,
                                  CRUISE_ALT + MAX_VZ_DELTA)
                 last_vy = v_strafe
-                print(f'  [TRANSIT] t={tick:3d} SEEN  cx={cx:6.1f} cy={cy:6.1f} '
-                      f'ex={e_x:+5.0f} ey={e_y:+5.0f} vy={v_strafe:+.3f} z={target_z:.2f}')
                 self._safe_hover(vx=TRANSIT_VX, vy=v_strafe, z=target_z)
             elif status == 'new_miss':
                 miss += 1
@@ -955,6 +1222,10 @@ class GateController:
         self._cf.param.set_value('kalman.resetEstimation', '0')
         time.sleep(2)
 
+        if not self._log_ready.wait(timeout=5.0):
+            print('No state estimate received — aborting vision mission')
+            return
+
         # ── background frame saver ─────────────────────────────────────────────
         os.makedirs('gate_frames', exist_ok=True)
         frame_idx    = [0]
@@ -976,38 +1247,167 @@ class GateController:
         # ──────────────────────────────────────────────────────────────────────
 
         try:
+            s = self._current_state()
+            start_x = s['x']
+            start_y = s['y']
+            start_yaw = s['yaw']
+            self._hold_x = start_x
+            self._hold_y = start_y
+            self._hold_z = CRUISE_ALT
+            self._hold_yaw = start_yaw
+            self._search_yaw_deg = start_yaw
+
+            yaw_r = math.radians(start_yaw)
+            self._circuit_center = np.array([
+                start_x + CIRCUIT_OFFSET * math.cos(yaw_r),
+                start_y + CIRCUIT_OFFSET * math.sin(yaw_r),
+            ])
+            print(f'Start: x={start_x:.2f}  y={start_y:.2f}  yaw={start_yaw:.1f}°')
+            print(f'Circuit centre: ({self._circuit_center[0]:.2f}, {self._circuit_center[1]:.2f})')
+
             self.takeoff(target_z=CRUISE_ALT)
 
-            # ── SIMPLE MISSION: search → approach → transit × N_GATES ──────────
+            mission_complete = False
             for gate_idx in range(N_GATES):
                 if self._stop:
                     break
 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
-                self._reset_detection_filter()  # fresh EMA per gate
+                self._frames_detected = 0
+                self._lost_count = 0
+                mission_state = FIRST_TRIANGULATION
+                print(f'[{mission_state}]')
 
-                # 1. Sweep yaw until the gate appears in frame, then hover to
-                #    confirm the detection is stable before committing.
                 while not self._stop:
-                    self.search_for_gate()
-                    if self._stop or self.lock_on_gate():
-                        break
+                    s = self._current_state()
+                    det = self._detect()
 
-                if self._stop:
+                    if mission_state == FIRST_TRIANGULATION:
+                        self._hold_x = s['x']
+                        self._hold_y = s['y']
+                        self._hold_z = CRUISE_ALT
+                        self._hold_yaw = self._search_yaw_deg
+                        self._search_yaw_deg += SEARCH_YAW_RATE * 0.1
+                        self._search_yaw_total += SEARCH_YAW_RATE * 0.1
+                        self._hold()
+
+                        if det is not None:
+                            status, quad_norm, cx_norm = det
+                            if status == 'commit_to_pass':
+                                self._force_pass(s)
+                                mission_state = TRAVEL_TO_GATE
+                                print(f'[{mission_state}] from FIRST_TRIANGULATION commit')
+                            elif status == 'ok' and self._validate_detection(quad_norm, s) is not None:
+                                gate_angle = math.atan2(cx_norm, 1.0)
+                                self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
+                                self._frames_detected += 1
+                                self._lost_count = 0
+                                if self._frames_detected >= REQ_FRAMES:
+                                    self._P = np.array([s['x'], s['y'], s['z']])
+                                    self._r_corners = self._corners_to_rays(quad_norm, s)
+                                    self._frames_detected = 0
+                                    yaw_r = math.radians(s['yaw'])
+                                    self._lat_x = s['x'] + LATERAL_DIST * math.sin(yaw_r)
+                                    self._lat_y = s['y'] + LATERAL_DIST * -math.cos(yaw_r)
+                                    self._lat_z = CRUISE_ALT
+                                    mission_state = LATERAL_DRIFT
+                                    print(f'[{mission_state}] to ({self._lat_x:.2f},{self._lat_y:.2f})')
+                            else:
+                                self._frames_detected = 0
+                                self._lost_count += 1
+                                if self._lost_count >= LOST_THRESHOLD:
+                                    print(f'[{FIRST_TRIANGULATION}] gate lost, retrying')
+                                    self._lost_count = 0
+
+                    elif mission_state == LATERAL_DRIFT:
+                        self._send(self._lat_x, self._lat_y, self._lat_z, self._hold_yaw)
+                        if self._dist3(s, self._lat_x, self._lat_y, self._lat_z) < PASS_TOLERANCE:
+                            self._hold_x = self._lat_x
+                            self._hold_y = self._lat_y
+                            self._frames_detected = 0
+                            self._lost_count = 0
+                            mission_state = SECOND_TRIANGULATION
+                            print(f'[{mission_state}]')
+
+                    elif mission_state == SECOND_TRIANGULATION:
+                        self._hold()
+                        if det is not None:
+                            status, quad_norm, cx_norm = det
+                            if status == 'commit_to_pass':
+                                self._force_pass(s)
+                                mission_state = TRAVEL_TO_GATE
+                                print(f'[{mission_state}] from SECOND_TRIANGULATION commit')
+                            elif status == 'ok' and self._validate_detection(quad_norm, s) is not None:
+                                gate_angle = math.atan2(cx_norm, 1.0)
+                                self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
+                                self._frames_detected += 1
+                                self._lost_count = 0
+                                if self._frames_detected >= REQ_FRAMES:
+                                    self._Q = np.array([s['x'], s['y'], s['z']])
+                                    self._s_corners = self._corners_to_rays(quad_norm, s)
+                                    self._frames_detected = 0
+                                    mission_state = COMPUTE_GATE_POS
+                                    print(f'[{mission_state}]')
+                            else:
+                                self._frames_detected = 0
+                                self._lost_count += 1
+                                if self._lost_count >= LOST_THRESHOLD:
+                                    print(f'[{FIRST_TRIANGULATION}] gate lost during SECOND_TRIANGULATION')
+                                    self._lost_count = 0
+                                    mission_state = FIRST_TRIANGULATION
+
+                    elif mission_state == COMPUTE_GATE_POS:
+                        self._hold()
+                        try:
+                            _, H, gate_yaw = self._triangulate()
+                            print(f'Gate {self._gate_count + 1}: centre=({H[0]:.2f},{H[1]:.2f},{H[2]:.2f}) '
+                                  f'yaw={math.degrees(gate_yaw):.1f}°')
+                            self._set_gate_waypoints(H, gate_yaw, s)
+                            mission_state = TRAVEL_TO_GATE
+                            print(f'[{mission_state}]')
+                        except Exception as e:
+                            print(f'Triangulation failed ({e}) — retrying')
+                            self._frames_detected = 0
+                            self._lost_count = 0
+                            mission_state = FIRST_TRIANGULATION
+
+                    elif mission_state == TRAVEL_TO_GATE:
+                        gyd = math.degrees(self._gate_yaw)
+                        if self._travel_phase == 0:
+                            self._send(self._app_x, self._app_y, self._gate_z, gyd)
+                            if self._dist3(s, self._app_x, self._app_y, self._gate_z) < PASS_TOLERANCE:
+                                self._travel_phase = 1
+                        elif self._travel_phase == 1:
+                            self._send(self._mid_x, self._mid_y, self._gate_z, gyd)
+                            if self._dist3(s, self._mid_x, self._mid_y, self._gate_z) < PASS_TOLERANCE:
+                                self._travel_phase = 2
+                        elif self._travel_phase == 2:
+                            self._send(self._exit_x, self._exit_y, self._gate_z, gyd)
+                            if self._dist3(s, self._exit_x, self._exit_y, self._gate_z) < PASS_TOLERANCE:
+                                self._gate_count += 1
+                                print(f'Gate {self._gate_count} passed!')
+                                self._hold_x = s['x']
+                                self._hold_y = s['y']
+                                self._hold_yaw = s['yaw']
+                                self._search_yaw_deg = s['yaw']
+                                self._search_yaw_total = 0.0
+                                if self._gate_count >= N_GATES:
+                                    print(f'[{DONE}] all {N_GATES} gates passed — hovering')
+                                    mission_complete = True
+                                    break
+                                else:
+                                    mission_state = FIRST_TRIANGULATION
+                                    print(f'[{mission_state}] ({self._gate_count}/{N_GATES} done)')
+
+                    elif mission_state == DONE:
+                        self._hold()
+
+                    time.sleep(0.1)
+
+                if mission_complete:
                     break
 
-                # 2. Servo toward gate; if lost mid-approach, search again
-                while not self._stop:
-                    if self.approach_gate():
-                        self.transit_gate()
-                        break
-                    print('  gate lost — searching again')
-                    while not self._stop:
-                        self.search_for_gate()
-                        if self._stop or self.lock_on_gate():
-                            break
-
-            msg = 'All gates complete' if not self._stop else 'Emergency stop'
+            msg = 'All gates complete' if mission_complete and not self._stop else 'Emergency stop'
             print(f'\n{msg} — landing')
             # ──────────────────────────────────────────────────────────────────
 
@@ -1387,16 +1787,21 @@ if __name__ == '__main__':
         cf.close_link()
         exit(1)
 
-    # Live FPV window with detection overlay
-    fpv = None
+    # Live FPV window — runs in a SEPARATE PROCESS so its GUI work cannot
+    # GIL-stall the UDP recv thread or the control loop.
+    fpv_proc = None
+    fpv_q = None
     if FPV_ENABLED and cam is not None:
-        fpv = FpvViewerThread(cam, ctrl)
-        fpv.start()
-        print('FPV viewer started')
+        fpv_q = mp.Queue(maxsize=1)   # latest-wins; controller drops if full
+        ctrl._fpv_q = fpv_q
+        fpv_proc = mp.Process(
+            target=_fpv_viewer_process,
+            args=(fpv_q, FPV_SCALE, CAM_WIDTH, CAM_HEIGHT, GATE_SIZE_CLOSE),
+            daemon=True, name='FpvViewerProc')
+        fpv_proc.start()
+        print(f'FPV viewer process started (pid={fpv_proc.pid})')
 
     # Emergency stop listener
-    # threading.Thread(target=emergency_stop_listener,args=(ctrl, cam, cf), daemon=True).start()
-    # emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
     emergency_stop_thread = threading.Thread(target=emergency_stop_listener, args=(ctrl, cam, cf), daemon=True)
     emergency_stop_thread.start()
 
@@ -1406,8 +1811,13 @@ if __name__ == '__main__':
         else:
             ctrl.run_fast_lap(GATE_POSITIONS, N_LAPS)
     finally:
-        if fpv is not None:
-            fpv.stop()
+        if fpv_q is not None:
+            try:
+                fpv_q.put_nowait(None)  # graceful shutdown sentinel
+            except Exception:
+                pass
+        if fpv_proc is not None:
+            fpv_proc.join(timeout=1.0)
         if cam is not None:
             cam.stop()
         cf.close_link()
