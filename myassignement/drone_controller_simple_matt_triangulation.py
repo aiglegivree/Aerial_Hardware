@@ -477,8 +477,12 @@ class GateController:
         self._hold_z = CRUISE_ALT
         self._hold_yaw = 0.0
 
-        # SEARCH yaw target accumulator (deg)
+        # SEARCH yaw target accumulator (deg) + sweep direction.
+        # First gate is to the right of the start pose, so we sweep CW
+        # (negative). Flips to CCW (positive) once the first gate is passed,
+        # because all subsequent gates are arranged CCW around the centre.
         self._search_yaw_deg = 0.0
+        self._search_dir     = -1.0
 
         # LATERAL_MOVE target + settle timer
         self._lat_x = self._lat_y = self._lat_z = 0.0
@@ -746,7 +750,8 @@ class GateController:
 
                 # ── SEARCH ───────────────────────────────────────────────────
                 if mission_state == SEARCH:
-                    self._search_yaw_deg += SEARCH_YAW_RATE * SETPOINT_PERIOD
+                    self._search_yaw_deg += (self._search_dir
+                                             * SEARCH_YAW_RATE * SETPOINT_PERIOD)
                     self._hold_yaw = self._search_yaw_deg
                     self._hold()
 
@@ -771,9 +776,13 @@ class GateController:
                         mission_state = TRAVEL_GATE
                         print(f'[{TRAVEL_GATE}] from DETECT_1 commit')
                     elif status == 'ok':
-                        cx_norm = float(np.mean(quad_norm[:, 0]))
-                        gate_angle = math.atan2(cx_norm, 1.0)
-                        self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
+                        # Only re-aim before we start counting samples; once
+                        # frames_detected > 0 we hold the yaw constant so
+                        # the drone is truly still while we accumulate views.
+                        if self._frames_detected == 0:
+                            cx_norm = float(np.mean(quad_norm[:, 0]))
+                            gate_angle = math.atan2(cx_norm, 1.0)
+                            self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
                         self._lost_count = 0
 
                         speed = math.sqrt(s['vx']**2 + s['vy']**2 + s['vz']**2)
@@ -857,9 +866,11 @@ class GateController:
                         mission_state = TRAVEL_GATE
                         print(f'[{TRAVEL_GATE}] from DETECT_2 commit')
                     elif status == 'ok':
-                        cx_norm = float(np.mean(quad_norm[:, 0]))
-                        gate_angle = math.atan2(cx_norm, 1.0)
-                        self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
+                        # Same freeze-during-sampling rule as DETECT_1.
+                        if self._frames_detected == 0:
+                            cx_norm = float(np.mean(quad_norm[:, 0]))
+                            gate_angle = math.atan2(cx_norm, 1.0)
+                            self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
                         self._lost_count = 0
 
                         speed = math.sqrt(s['vx']**2 + s['vy']**2 + s['vz']**2)
@@ -951,6 +962,10 @@ class GateController:
                             self._hold_x, self._hold_y = s['x'], s['y']
                             self._hold_yaw = s['yaw']
                             self._search_yaw_deg = s['yaw']
+                            # After the first gate, the remaining gates are
+                            # arranged CCW around the centre → sweep CCW.
+                            if self._gate_count == 1:
+                                self._search_dir = +1.0
                             if self._gate_count >= N_GATES:
                                 mission_state = DONE
                                 print(f'[{DONE}] all {N_GATES} gates — hovering')
