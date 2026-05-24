@@ -771,13 +771,9 @@ class GateController:
                         mission_state = TRAVEL_GATE
                         print(f'[{TRAVEL_GATE}] from DETECT_1 commit')
                     elif status == 'ok':
-                        # Only re-aim before we start counting samples; once
-                        # frames_detected > 0 we hold the yaw constant so
-                        # the drone is truly still while we accumulate views.
-                        if self._frames_detected == 0:
-                            cx_norm = float(np.mean(quad_norm[:, 0]))
-                            gate_angle = math.atan2(cx_norm, 1.0)
-                            self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
+                        cx_norm = float(np.mean(quad_norm[:, 0]))
+                        gate_angle = math.atan2(cx_norm, 1.0)
+                        self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
                         self._lost_count = 0
 
                         speed = math.sqrt(s['vx']**2 + s['vy']**2 + s['vz']**2)
@@ -861,11 +857,9 @@ class GateController:
                         mission_state = TRAVEL_GATE
                         print(f'[{TRAVEL_GATE}] from DETECT_2 commit')
                     elif status == 'ok':
-                        # Same freeze-during-sampling rule as DETECT_1.
-                        if self._frames_detected == 0:
-                            cx_norm = float(np.mean(quad_norm[:, 0]))
-                            gate_angle = math.atan2(cx_norm, 1.0)
-                            self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
+                        cx_norm = float(np.mean(quad_norm[:, 0]))
+                        gate_angle = math.atan2(cx_norm, 1.0)
+                        self._hold_yaw = math.degrees(math.radians(s['yaw']) - gate_angle)
                         self._lost_count = 0
 
                         speed = math.sqrt(s['vx']**2 + s['vy']**2 + s['vz']**2)
