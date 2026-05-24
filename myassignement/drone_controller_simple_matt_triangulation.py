@@ -17,6 +17,7 @@ which lets us recover the gate's full pose (centre + yaw of its plane) via a
 """
 
 import contextlib
+import datetime
 import logging
 import math
 import os
@@ -60,6 +61,13 @@ CAM_HEIGHT = 244
 FPV_ENABLED  = True
 FPV_SCALE    = 2
 FPV_RATE_HZ  = 10
+
+# ── frame saver ───────────────────────────────────────────────────────────────
+# Writes are done on a dedicated thread that only READS cam.latest_frame
+# (by reference under the cam's lock), so the UDP receiver is never blocked.
+SAVE_FRAMES         = True
+SAVE_FRAMES_DIR     = 'flight_frames'   # parent; per-run subfolder is timestamped
+SAVE_FRAMES_RATE_HZ = 15
 
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
@@ -283,6 +291,49 @@ class FpvViewerThread(threading.Thread):
             cv2.destroyWindow(win)
         except Exception:
             pass
+
+
+# ── frame saver thread ────────────────────────────────────────────────────────
+
+class FrameSaverThread(threading.Thread):
+    """
+    Periodically copies cam.latest_frame to disk. Skips repeats by reference
+    identity, so only genuinely new frames hit the filesystem. Runs on its
+    own thread — UDP receiver and FPV viewer are untouched.
+    """
+
+    def __init__(self, cam: 'UdpVideoThread', folder: str,
+                 rate_hz: float = SAVE_FRAMES_RATE_HZ):
+        super().__init__(daemon=True, name='FrameSaverThread')
+        self._cam     = cam
+        self._folder  = folder
+        self._period  = 1.0 / max(1.0, rate_hz)
+        self._running = False
+        self._idx     = 0
+
+    def start(self):
+        os.makedirs(self._folder, exist_ok=True)
+        print(f'[SAVER] writing frames to {self._folder} at {1.0 / self._period:.0f} Hz')
+        self._running = True
+        super().start()
+
+    def stop(self):
+        self._running = False
+
+    def run(self):
+        last = None
+        while self._running:
+            frame = self._cam.latest_frame
+            if frame is not None and frame is not last:
+                last = frame
+                path = os.path.join(self._folder, f'frame_{self._idx:05d}.jpg')
+                try:
+                    cv2.imwrite(path, frame)
+                    self._idx += 1
+                except Exception as e:
+                    print(f'[SAVER] write failed: {e!r}')
+            time.sleep(self._period)
+        print(f'[SAVER] stopped — {self._idx} frames saved to {self._folder}')
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -901,6 +952,14 @@ if __name__ == '__main__':
         fpv.start()
         print('FPV viewer started')
 
+    saver = None
+    if SAVE_FRAMES:
+        run_folder = os.path.join(
+            SAVE_FRAMES_DIR,
+            datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+        saver = FrameSaverThread(cam, run_folder)
+        saver.start()
+
     threading.Thread(
         target=emergency_stop_listener,
         args=(ctrl,),
@@ -910,6 +969,8 @@ if __name__ == '__main__':
     try:
         ctrl.run_mission()
     finally:
+        if saver is not None:
+            saver.stop()
         if fpv is not None:
             fpv.stop()
         if cam is not None:
