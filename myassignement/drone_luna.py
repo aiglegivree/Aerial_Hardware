@@ -108,22 +108,28 @@ LAND_DURATION    = 3.0   # s
 MAX_VZ_STEP = 0.005
 
 # IBVS gains — tune these on the real drone
-KP_VX        = 0.010  # size error  (GATE_SIZE_CLOSE - size) → forward speed
+KP_VX        = 0.005  # size error  (GATE_SIZE_CLOSE - size) → forward speed
 KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
 KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
 MAX_VX       = 0.10    # m/s — forward cap (never backward)
 MAX_VY       = 0.10   # m/s — strafe cap
 MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
+ALIGN_TOL_ARM    = 0.10  # arm forward motion when |asymmetry| below this
+ALIGN_TOL_DISARM = 0.20  # disarm forward motion when |asymmetry| above this (hysteresis)
+PARK_HOLD_S      = 0.3   # all conditions must hold this long before forward motion
+
 # Yaw alignment from gate edge asymmetry
 KP_YAW_ALIGN   = 8.0   # deg/s per unit-asymmetry; max yaw = KP × 1.0
 MAX_YAW_ALIGN  = 8.0   # deg/s — hard cap on alignment yaw rate
 ALIGN_DEADBAND = 0.08  # |asymmetry| below this is treated as head-on (no yaw)
 
+CENTER_TOL_PX = 20  # px — gate must be within this of frame centre before approaching
+
 TRANSIT_VX   = 0.10    # m/s
 TRANSIT_TIME = 4.0    # s
 
-SEARCH_YAW_RATE   = 15.0  # deg/s — yaw cap used by patrol waypointing
+SEARCH_YAW_RATE   = 10.0  # deg/s — yaw cap used by patrol waypointing
 SEARCH_SWEEP_RATE = 7.0   # deg/s — peak yaw rate during yaw sweep
 SEARCH_SWEEP_PERIOD = 10.0  # s   — full oscillation period (gives ±45° at 7 deg/s)
 LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
@@ -418,7 +424,17 @@ class FpvViewerThread(threading.Thread):
                                   (CAM_WIDTH * FPV_SCALE, CAM_HEIGHT * FPV_SCALE),
                                   interpolation=cv2.INTER_NEAREST)
             cv2.imshow(win, disp)
-            if (cv2.waitKey(1) & 0xFF) == ord('Q'):  # capital Q only — lowercase q is emergency stop
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('Q'):
+                if self._ctrl is not None:
+                    print('\n[STOP] Q (FPV window) — cutting motors immediately')
+                    self._ctrl._stop = True
+                    self._ctrl._stop_motors()
+                break
+            elif key == 27:  # ESC
+                if self._ctrl is not None:
+                    print('\n[STOP] ESC (FPV window) — landing')
+                    self._ctrl._stop = True
                 break
         try:
             cv2.destroyWindow(win)
@@ -432,12 +448,22 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def _fill_holes(mask):
-    """Fill dark regions fully enclosed by white — turns a closed gate
-    outline into a solid rectangle so the contour shape tests are reliable."""
-    flood = mask.copy()
+    """Fill regions fully enclosed by white. Bail out on degenerate cases."""
     h, w = mask.shape
-    scratch = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, scratch, (0, 0), 255)
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    scratch = np.zeros((h + 4, w + 4), np.uint8)
+    cv2.floodFill(padded, scratch, (0, 0), 255)
+    flood = padded[1:-1, 1:-1]
+    
+    # Sanity check: a well-behaved mask has most pixels OUTSIDE all contours,
+    # i.e. the floodfill should mark > 50% of the image as exterior.
+    exterior_pixels = cv2.countNonZero(flood) - cv2.countNonZero(mask)
+    total = h * w
+    if exterior_pixels < 0.5 * total:
+        # Pathological case (contour touches all edges, or floodfill leaked).
+        # Don't fill — return original mask and let contour shape checks reject it.
+        return mask
+    
     return mask | cv2.bitwise_not(flood)
 
 def _gate_edge_heights(contour):
@@ -474,17 +500,9 @@ GATE_HSV_UPPER = np.array([255, 100, 255], dtype=np.uint8)
 
 
 def get_gate_detection(frame):
-    """
-    Detect the bright LED gate frame.
-    Returns: cx, cy, size  (or None, None, None if no gate-shaped contour).
-
-    The gate is a bright rectangle on a dark background, so it is segmented
-    with an HSV brightness mask, then the most rectangular contour is picked.
-    """
     if frame is None:
-        return None, None, None
+        return None, None, None, None, None, None
 
-    # Bright-LED mask in HSV space
     if len(frame.shape) == 3:
         bgr = frame
     else:
@@ -492,22 +510,22 @@ def get_gate_detection(frame):
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, GATE_HSV_LOWER, GATE_HSV_UPPER)
 
-    # Close gaps along the thin gate edges, then fill the interior so the gate
-    # becomes a solid rectangle (a broken outline fails the shape tests below).
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((20, 5), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 20), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     mask = _fill_holes(mask)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     best_score = 0.0
     best_gate = None
+    best_rect = None
 
+    # ── Primary: shape-filtered scoring ──────────────────────────────
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 250:
+        if area < 5000:
             continue
 
         rect = cv2.minAreaRect(cnt)
@@ -515,37 +533,77 @@ def get_gate_detection(frame):
         if rw < 10 or rh < 10:
             continue
 
-        # Aspect ratio check
         short_side, long_side = sorted([rw, rh])
         aspect = short_side / long_side
         if aspect < 0.45:
             continue
 
-        # Rectangularity check
         rotated_area = rw * rh
         rectangularity = area / rotated_area
-        if rectangularity < 0.80:
-            continue
 
-        # Solidity check
         hull_area = cv2.contourArea(cv2.convexHull(cnt))
         if hull_area <= 0:
             continue
         solidity = area / hull_area
-        if solidity < 0.85:
+
+        size_half = max(rw, rh) / 2
+        edge_clipped = (rcx - size_half < 4 or
+                        rcx + size_half > CAM_WIDTH  - 4 or
+                        rcy - size_half < 4 or
+                        rcy + size_half > CAM_HEIGHT - 4)
+
+        if edge_clipped:
+            rect_min, solid_min = 0.55, 0.55
+        else:
+            rect_min, solid_min = 0.80, 0.85
+
+        if rectangularity < rect_min:
+            continue
+        if solidity < solid_min:
             continue
 
-        # Score based on shape perfection and size
-        score = rectangularity * solidity * np.log1p(area)
+        score = rectangularity * solidity * area
         if score > best_score:
             best_score = score
-            # Return center x, center y, and the largest dimension as "size"
             left_h, right_h = _gate_edge_heights(cnt)
+            best_rect = rect
             best_gate = (rcx, rcy, max(rw, rh), left_h, right_h)
 
+    # ── Fallback: large edge-touching contours ───────────────────────
+    if best_gate is None:
+        FALLBACK_AREA_MIN = 700
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < FALLBACK_AREA_MIN:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            touches_edge = (x <= 2 or y <= 2 or
+                            x + w >= CAM_WIDTH  - 2 or
+                            y + h >= CAM_HEIGHT - 2)
+            if not touches_edge:
+                continue
+
+            rect = cv2.minAreaRect(cnt)
+            (rcx, rcy), (rw, rh), _ = rect
+            if rw < 10 or rh < 10:
+                continue
+
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter < 50:
+                continue
+
+            if area > best_score:
+                best_score = area
+                left_h, right_h = _gate_edge_heights(cnt)
+                best_rect = rect
+                best_gate = (rcx, rcy, max(rw, rh), left_h, right_h)
+
+    # ── Single return path ───────────────────────────────────────────
     if best_gate is not None:
-        return best_gate[0], best_gate[1], best_gate[2], best_gate[3], best_gate[4]
-    return None, None, None, None, None
+        box_pts = cv2.boxPoints(best_rect)
+        return best_gate[0], best_gate[1], best_gate[2], best_gate[3], best_gate[4], box_pts
+    return None, None, None, None, None, None
 
 
 # ── minimum-jerk trajectory planner ─────────────────────────────────────────────
@@ -755,26 +813,35 @@ class GateController:
 
     def search_for_gate(self):
         """
-        Search logic: Continuous Sweep
-        Oscillates the yaw back and forth to scan the immediate area.
+        Matt-style search: continuous CCW rotation at SEARCH_YAW_RATE deg/s.
+        Once a gate is spotted, stop spinning and proportionally yaw to centre
+        it in the frame before returning — so lock_on_gate starts with the gate
+        already roughly centred, not at some random edge position.
         """
-        print('  [SEARCH] Sweeping...')
-        t_start = time.time()
+        print('  [SEARCH] rotating CCW...')
+        cx_mid   = CAM_WIDTH / 2.0
+        ALIGN_PX = 30   # px — gate must be within this of frame centre to exit
 
         while not self._stop:
-            # 1. Check the camera
             cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
-            if cx is not None:
-                print(f'  [SEARCH] gate found  cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px')
-                return
 
-            # 2. Start to look around
-            elapsed = time.time() - t_start
+            if cx is None:
+                # No gate — keep spinning CCW at fixed rate
+                self._hover(yaw_rate=SEARCH_YAW_RATE, z=CRUISE_ALT)
+            else:
+                # Gate found: e_x > 0 → gate left of centre → yaw CCW (positive)
+                #             e_x < 0 → gate right of centre → yaw CW (negative)
+                e_x = cx_mid - cx
+                print(f'  [SEARCH] gate spotted  cx={cx:.0f}  e_x={e_x:+.0f}px  size={size:.0f}px')
 
-            # Sinusoidal sweep: ±45° at SEARCH_SWEEP_RATE deg/s peak
-            # amplitude = SEARCH_SWEEP_RATE / ω = SEARCH_SWEEP_RATE × T/(2π) ≈ 45°
-            sweep_yaw_rate = math.sin(elapsed * 2 * math.pi / SEARCH_SWEEP_PERIOD) * SEARCH_SWEEP_RATE
-            self._hover(yaw_rate=sweep_yaw_rate, z=CRUISE_ALT)
+                if abs(e_x) < ALIGN_PX:
+                    print('  [SEARCH] gate centred → LOCK')
+                    return
+
+                # Proportional yaw toward gate, capped at SEARCH_YAW_RATE
+                yaw_rate = clamp(SEARCH_YAW_RATE * e_x / cx_mid,
+                                 -SEARCH_YAW_RATE, SEARCH_YAW_RATE)
+                self._hover(yaw_rate=yaw_rate, z=CRUISE_ALT)
 
             time.sleep(0.05)
 
@@ -813,24 +880,30 @@ class GateController:
 
     def approach_gate(self):
         """
-        Image-Based Visual Servoing (IBVS).
+        Image-Based Visual Servoing (IBVS) with park-before-approach.
 
-        Three pixel errors drive three independent velocity commands:
-          e_x = cx - cx_mid          → vy  (strafe left/right)
-          e_y = cy_mid - cy          → Δz  (climb/descend)
-          e_z = GATE_SIZE_CLOSE - sz → vx  (fly forward, never backward)
+        The drone first strafes, climbs/descends, and yaws to position itself
+        head-on in front of the gate. Only once ALL three conditions hold
+        continuously for PARK_HOLD_S does it start advancing forward.
 
-        Each error is multiplied by its Kp gain and clamped to a safe speed.
-        The drone flies forward until the gate fills the frame (size ≥ GATE_SIZE_CLOSE).
+        |e_x| < CENTER_TOL_PX   — gate horizontally centred
+        |e_y| < CENTER_TOL_PX   — gate vertically centred
+        |asymmetry| < ALIGN_TOL — gate viewed head-on (edges equal)
 
         Returns True  when size ≥ GATE_SIZE_CLOSE  (→ TRANSIT).
         Returns False when gate lost > LOST_TOLERANCE (→ SEARCH).
         """
-        print('  [APPROACH] IBVS toward gate')
-        cx_mid   = CAM_WIDTH  / 2.0   # 162 px
-        cy_mid   = CAM_HEIGHT / 2.0   # 122 px
+        print('  [APPROACH] IBVS toward gate (park-first)')
+        cx_mid   = CAM_WIDTH  / 2.0
+        cy_mid   = CAM_HEIGHT / 2.0
         target_z = CRUISE_ALT
         lost     = 0
+
+        # Per-attempt parking state (reset on every approach_gate call)
+        park_armed = False         # True once all 3 conditions have held PARK_HOLD_S
+        park_t0    = None          # time at which conditions first became all-true
+
+        EDGE_MARGIN = 8            # px — gate touching frame edge → don't trust asymmetry
 
         while not self._stop:
             cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
@@ -840,66 +913,88 @@ class GateController:
                 if lost > LOST_TOLERANCE:
                     print('  [APPROACH] gate lost — back to SEARCH')
                     return False
-                # Hold last commanded altitude while waiting for gate to reappear
                 self._hover(z=target_z)
                 time.sleep(0.05)
                 continue
 
             lost = 0
 
-            # ── Step 1: check termination ───────────────────────────────────
+            # ── Step 1: termination ─────────────────────────────────────────
             if size >= GATE_SIZE_CLOSE:
                 print(f'  [APPROACH] gate fills frame (size={size:.0f}px) → TRANSIT')
                 return True
 
             # ── Step 2: pixel errors ────────────────────────────────────────
-            e_x = -cx + cx_mid          # +ve → gate right of centre
-            e_y = cy_mid - cy          # +ve → gate above centre
-            e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small → move forward
+            e_x = -cx + cx_mid          # +ve → gate left of centre
+            e_y = cy_mid - cy           # +ve → gate above centre
+            e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small
 
-            # ── Step 3: proportional control ────────────────────────────────
-            v_strafe  = KP_VY * e_x
-            v_forward = KP_VX * e_z
-
-            # ── Step 3b: yaw alignment from edge-length asymmetry ────────────
-            # If the gate looks like a trapezoid (one vertical edge longer
-            # than the other), yaw toward the longer edge so that combined
-            # with the IBVS strafe, the drone orbits around the gate to a
-            # head-on view.
-            #
-            # left_h > right_h  → drone is on the gate's right → yaw LEFT (CCW)
-            # right_h > left_h  → drone is on the gate's left  → yaw RIGHT (CW)
-            yaw_rate = 0.0
+            # ── Step 3: yaw alignment from edge asymmetry ────────────────────
+            # Reject the asymmetry signal when the gate clips a frame edge —
+            # a half-visible gate produces fake trapezoid asymmetry that won't
+            # decay no matter how the drone moves.
+            asymmetry = 0.0
+            have_align = False
             if left_h is not None and right_h is not None:
-                long_edge = max(left_h, right_h)
-                if long_edge > 1e-3:
-                    asymmetry = (left_h - right_h) / long_edge  # in [-1, +1]
-                    if abs(asymmetry) > ALIGN_DEADBAND:
-                        yaw_rate = clamp(KP_YAW_ALIGN * asymmetry,
-                                         -MAX_YAW_ALIGN, MAX_YAW_ALIGN)
+                edge_clipped = (cx - size/2 < EDGE_MARGIN or
+                                cx + size/2 > CAM_WIDTH - EDGE_MARGIN)
+                if not edge_clipped:
+                    long_edge = max(left_h, right_h)
+                    if long_edge > 1e-3:
+                        asymmetry = (left_h - right_h) / long_edge  # in [-1, +1]
+                        have_align = True
 
-            if yaw_rate != 0.0:
-                print(f'  [ALIGN] left_h={left_h:.0f}px right_h={right_h:.0f}px '
-                      f'asym={asymmetry:+.2f} → yaw_rate={yaw_rate:+.1f}°/s')
+            yaw_rate = 0.0
+            if have_align and abs(asymmetry) > ALIGN_DEADBAND:
+                yaw_rate = clamp(KP_YAW_ALIGN * asymmetry,
+                                -MAX_YAW_ALIGN, MAX_YAW_ALIGN)
 
-            # ── Step 4: clamp horizontal speeds ─────────────────────────────
-            v_strafe  = clamp(v_strafe,  -MAX_VY,  MAX_VY)
-            v_forward = clamp(v_forward,  0.0,     MAX_VX)   # never fly backward
+            # ── Step 4: strafe always active ────────────────────────────────
+            v_strafe = clamp(KP_VY * e_x, -MAX_VY, MAX_VY)
 
-            # ── Step 4b: rate-limited altitude update ───────────────────────
-            # Compute where the pixel error WANTS target_z to be, then move
-            # current target_z toward it by at most MAX_VZ_STEP per tick.
+            # ── Step 5: park-before-approach gating with hysteresis ─────────
+            centered = abs(e_x) < CENTER_TOL_PX and abs(e_y) < CENTER_TOL_PX
+            # If we can't measure alignment (no edges, or clipped), don't block
+            # on it — fall back to centering-only.
+            aligned = (not have_align) or abs(asymmetry) < ALIGN_TOL_ARM
+
+            # Hysteresis: once armed, only disarm if asymmetry blows out
+            if park_armed:
+                disarm = have_align and abs(asymmetry) > ALIGN_TOL_DISARM
+                if disarm or not centered:
+                    park_armed = False
+                    park_t0    = None
+                    print('  [PARK] lost alignment — pausing forward motion')
+            else:
+                parked_now = centered and aligned
+                if parked_now:
+                    if park_t0 is None:
+                        park_t0 = time.time()
+                    elif time.time() - park_t0 >= PARK_HOLD_S:
+                        park_armed = True
+                        print('  [PARK] held — arming forward motion')
+                else:
+                    park_t0 = None
+
+            v_forward = clamp(KP_VX * e_z, 0.0, MAX_VX) if park_armed else 0.0
+
+            # ── Step 6: rate-limited altitude ───────────────────────────────
             desired_dz = clamp(KP_VZ * e_y, -MAX_VZ_DELTA, MAX_VZ_DELTA)
             target_z_desired = clamp(CRUISE_ALT + desired_dz,
-                                     CRUISE_ALT - MAX_VZ_DELTA,
-                                     CRUISE_ALT + MAX_VZ_DELTA)
+                                    CRUISE_ALT - MAX_VZ_DELTA,
+                                    CRUISE_ALT + MAX_VZ_DELTA)
             dz_step = clamp(target_z_desired - target_z, -MAX_VZ_STEP, MAX_VZ_STEP)
             target_z += dz_step
 
-            print(f'  [IBVS] ex={e_x:+.0f}px ey={e_y:+.0f}px size={size:.0f}px'
-                  f'  → vx={v_forward:.2f} vy={v_strafe:+.2f} z={target_z:.2f}')
+            # ── Step 7: telemetry ───────────────────────────────────────────
+            status = 'GO' if park_armed else 'park'
+            align_str = f'{asymmetry:+.2f}' if have_align else '  -- '
+            print(f'  [IBVS|{status}] ex={e_x:+.0f} ey={e_y:+.0f} '
+                f'asym={align_str} size={size:.0f}px → '
+                f'vx={v_forward:.2f} vy={v_strafe:+.2f} '
+                f'yaw={yaw_rate:+.1f}°/s z={target_z:.2f}')
 
-            # ── Step 5: send command ─────────────────────────────────────────
+            # ── Step 8: send command ────────────────────────────────────────
             self._hover(vx=v_forward, vy=v_strafe, yaw_rate=yaw_rate, z=target_z)
             time.sleep(0.05)
 
@@ -1232,6 +1327,8 @@ def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazy
     """
     ESC -> set _stop; mission loop exits and its finally block lands cleanly.
     Q   -> cut motors immediately (drone drops).
+    Falls back gracefully if pynput can't install its hook (e.g. on Windows
+    without admin rights) — Q and ESC in the FPV window still work.
     """
     def on_press(key):
         if key == keyboard.Key.esc:
@@ -1247,8 +1344,11 @@ def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazy
         except AttributeError:
             pass
 
-    with keyboard.Listener(on_press=on_press) as listener:
-        listener.join()
+    try:
+        with keyboard.Listener(on_press=on_press) as listener:
+            listener.join()
+    except Exception as e:
+        print(f'[WARN] pynput keyboard listener failed ({e}) — use Q/ESC in the FPV window')
 
 
 # ── entry point ────────────────────────────────────────────────────────────────
