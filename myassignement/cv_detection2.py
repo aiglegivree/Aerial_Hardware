@@ -165,6 +165,18 @@ def find_corners_by_curvature(curve, n_corners=4,
         return None, smoothed, curv
     return smoothed[selected], smoothed, curv
 
+
+def contour_to_outer_quad(contour):
+    """
+    Better quad extraction: uses convex hull + minAreaRect
+    to force OUTER gate boundary instead of inner blob.
+    """
+    hull = cv2.convexHull(contour)
+
+    rect = cv2.minAreaRect(hull)
+    box = cv2.boxPoints(rect)  # 4 corners
+    return box.astype(np.float32)
+
 # ── full detector ──────────────────────────────────────────────────────────────
 
 def detect_gate(gray, k=K, dist_coeffs=DIST,
@@ -235,15 +247,24 @@ def detect_gate(gray, k=K, dist_coeffs=DIST,
     contour, _ = max(accepted, key=lambda x: x[1])
     result['selected'] = contour
 
-    corners, approx = find_corners_polydp(contour)
-    result['smoothed']  = approx   # reuse key for FPV-style overlay
-    result['curvature'] = None
+    # corners, approx = find_corners_polydp(contour)
+    # result['smoothed']  = approx   # reuse key for FPV-style overlay
+    # result['curvature'] = None
 
-    if corners is None:
-        result['status'] = 'no_corners'
-        return result
+    # if corners is None:
+    #     result['status'] = 'no_corners'
+    #     return result
+    # corners = order_corners(corners)
 
+    # FORCE outer boundary quad (fixes “inside gate” issue)
+    corners = contour_to_outer_quad(contour)
+
+    # order consistently
     corners = order_corners(corners)
+
+    result['smoothed'] = corners   # just reuse for visualization consistency
+    result['curvature'] = None
+    
     result['quad_pix']  = corners
     result['quad_norm'] = cv2.undistortPoints(
         corners.reshape(-1, 1, 2).astype(np.float32), k, dist_coeffs
