@@ -115,8 +115,13 @@ MAX_VX       = 0.10    # m/s — forward cap (never backward)
 MAX_VY       = 0.10   # m/s — strafe cap
 MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
+# Yaw alignment from gate edge asymmetry
+KP_YAW_ALIGN   = 8.0   # deg/s per unit-asymmetry; max yaw = KP × 1.0
+MAX_YAW_ALIGN  = 8.0   # deg/s — hard cap on alignment yaw rate
+ALIGN_DEADBAND = 0.08  # |asymmetry| below this is treated as head-on (no yaw)
+
 TRANSIT_VX   = 0.10    # m/s
-TRANSIT_TIME = 2.0    # s
+TRANSIT_TIME = 4.0    # s
 
 SEARCH_YAW_RATE   = 15.0  # deg/s — yaw cap used by patrol waypointing
 SEARCH_SWEEP_RATE = 7.0   # deg/s — peak yaw rate during yaw sweep
@@ -435,6 +440,30 @@ def _fill_holes(mask):
     cv2.floodFill(flood, scratch, (0, 0), 255)
     return mask | cv2.bitwise_not(flood)
 
+def _gate_edge_heights(contour):
+    """
+    Approximate the gate contour as a quadrilateral and return the heights
+    (in pixels) of its left and right vertical edges.
+
+    Returns (left_h, right_h) on success, or (None, None) if a 4-point
+    polygon can't be fit cleanly to the contour.
+    """
+    peri = cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+    if len(approx) != 4:
+        return None, None
+
+    pts = approx.reshape(4, 2).astype(np.float32)
+    # Sort the four corners by x → leftmost 2 form the left edge,
+    # rightmost 2 form the right edge.
+    sorted_by_x = pts[np.argsort(pts[:, 0])]
+    left_pts  = sorted_by_x[:2]
+    right_pts = sorted_by_x[2:]
+
+    left_h  = float(np.linalg.norm(left_pts[0]  - left_pts[1]))
+    right_h = float(np.linalg.norm(right_pts[0] - right_pts[1]))
+    return left_h, right_h
+
 
 # Gate-detection HSV mask. The gates are bright glowing LED frames, so we
 # threshold on high brightness (V) with low-to-moderate saturation (S), any
@@ -511,12 +540,12 @@ def get_gate_detection(frame):
         if score > best_score:
             best_score = score
             # Return center x, center y, and the largest dimension as "size"
-            best_gate = (rcx, rcy, max(rw, rh))
+            left_h, right_h = _gate_edge_heights(cnt)
+            best_gate = (rcx, rcy, max(rw, rh), left_h, right_h)
 
     if best_gate is not None:
-        return best_gate[0], best_gate[1], best_gate[2]
-
-    return None, None, None
+        return best_gate[0], best_gate[1], best_gate[2], best_gate[3], best_gate[4]
+    return None, None, None, None, None
 
 
 # ── minimum-jerk trajectory planner ─────────────────────────────────────────────
@@ -734,7 +763,7 @@ class GateController:
 
         while not self._stop:
             # 1. Check the camera
-            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
             if cx is not None:
                 print(f'  [SEARCH] gate found  cx={cx:.0f}  cy={cy:.0f}  size={size:.0f}px')
                 return
@@ -764,7 +793,7 @@ class GateController:
         n_detected = 0
         last = None
         while time.time() < t_end and not self._stop:
-            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
             n_ticks += 1
             if cx is not None:
                 n_detected += 1
@@ -804,7 +833,7 @@ class GateController:
         lost     = 0
 
         while not self._stop:
-            cx, cy, size = get_gate_detection(self._cam.latest_frame)
+            cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
 
             if cx is None:
                 lost += 1
@@ -832,6 +861,27 @@ class GateController:
             v_strafe  = KP_VY * e_x
             v_forward = KP_VX * e_z
 
+            # ── Step 3b: yaw alignment from edge-length asymmetry ────────────
+            # If the gate looks like a trapezoid (one vertical edge longer
+            # than the other), yaw toward the longer edge so that combined
+            # with the IBVS strafe, the drone orbits around the gate to a
+            # head-on view.
+            #
+            # left_h > right_h  → drone is on the gate's right → yaw LEFT (CCW)
+            # right_h > left_h  → drone is on the gate's left  → yaw RIGHT (CW)
+            yaw_rate = 0.0
+            if left_h is not None and right_h is not None:
+                long_edge = max(left_h, right_h)
+                if long_edge > 1e-3:
+                    asymmetry = (left_h - right_h) / long_edge  # in [-1, +1]
+                    if abs(asymmetry) > ALIGN_DEADBAND:
+                        yaw_rate = clamp(KP_YAW_ALIGN * asymmetry,
+                                         -MAX_YAW_ALIGN, MAX_YAW_ALIGN)
+
+            if yaw_rate != 0.0:
+                print(f'  [ALIGN] left_h={left_h:.0f}px right_h={right_h:.0f}px '
+                      f'asym={asymmetry:+.2f} → yaw_rate={yaw_rate:+.1f}°/s')
+
             # ── Step 4: clamp horizontal speeds ─────────────────────────────
             v_strafe  = clamp(v_strafe,  -MAX_VY,  MAX_VY)
             v_forward = clamp(v_forward,  0.0,     MAX_VX)   # never fly backward
@@ -850,7 +900,7 @@ class GateController:
                   f'  → vx={v_forward:.2f} vy={v_strafe:+.2f} z={target_z:.2f}')
 
             # ── Step 5: send command ─────────────────────────────────────────
-            self._hover(vx=v_forward, vy=v_strafe, z=target_z)
+            self._hover(vx=v_forward, vy=v_strafe, yaw_rate=yaw_rate, z=target_z)
             time.sleep(0.05)
 
         return False
@@ -883,7 +933,7 @@ class GateController:
         print(f'  [PATROL] flying to waypoint ({wx:.2f}, {wy:.2f})')
         while not self._stop:
             if scan:
-                cx, cy, size = get_gate_detection(self._cam.latest_frame)
+                cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
                 if cx is not None:
                     print(f'  [PATROL] gate spotted  cx={cx:.0f}  size={size:.0f}px')
                     return 'found'
