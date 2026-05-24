@@ -87,7 +87,7 @@ CAM_WIDTH  = 324
 CAM_HEIGHT = 244
 
 # ── FPV viewer ────────────────────────────────────────────────────────────────
-FPV_ENABLED  = False  # show live camera window with detection overlay
+FPV_ENABLED  = True  # show live camera window with detection overlay
 FPV_SCALE    = 2      # upscale factor for the display window
 FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
                        # (kept low so the UDP receiver thread isn't GIL-starved
@@ -657,7 +657,6 @@ class GateController:
 
         self.is_connected = False
         self._stop        = False
-        self._killed      = False   # set by Q: motors already cut, skip land()
         self._state       = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0}
 
         # Log config is set up after connection (called from main)
@@ -1007,14 +1006,14 @@ class GateController:
         finally:
             save_running[0] = False
             print(f'[FRAME SAVER] stopped — {frame_idx[0]} frames saved to gate_frames/')
-            if self._killed:
-                print('[MISSION] motors already cut — skipping land')
-            else:
-                try:
-                    self.land()
-                except Exception as e:
-                    print(f'Land failed ({e}) — cutting motors')
-                    self._stop_motors()
+            # Always attempt a controlled landing, whatever happened above.
+            # _stop_motors() is NOT called here — land() does a gradual descent
+            # and only cuts motors at the end, so the drone doesn't just drop.
+            try:
+                self.land()
+            except Exception as e:
+                print(f'Land failed ({e}) — cutting motors')
+                self._stop_motors()
 
     # =========================================================================
     # PART 2 — position-based mission (known gate coordinates)
@@ -1149,14 +1148,11 @@ class GateController:
             print(f'\nUnhandled exception during fast lap: {e} — landing now')
 
         finally:
-            if self._killed:
-                print('[MISSION] motors already cut — skipping land')
-            else:
-                try:
-                    self.land()
-                except Exception as e:
-                    print(f'Land failed ({e}) — cutting motors')
-                    self._stop_motors()
+            try:
+                self.land()
+            except Exception as e:
+                print(f'Land failed ({e}) — cutting motors')
+                self._stop_motors()
 
 
 # ── emergency stop ─────────────────────────────────────────────────────────────
@@ -1178,29 +1174,18 @@ def emergency_stop_callback(cf):
 
 def emergency_stop_listener(ctrl: GateController, cam: UdpVideoThread, cf: Crazyflie):
     """
-    ESC → controlled landing: sets _stop so the mission loop exits cleanly
-          and its finally block handles the landing.  Nothing else — avoids
-          a race where two threads both call land() at the same time.
-
-    Q   → immediate motor cut: calls _stop_motors() right away (safe from
-          any thread), then sets _stop so the mission loop exits.  The
-          finally block will try land() afterwards, which is harmless since
-          the drone is already down.
-
-    No land() or close_link() is called here — those are handled by the
-    mission finally block and the __main__ finally block respectively.
+    ESC -> set _stop; mission loop exits and its finally block lands cleanly.
+    Q   -> cut motors immediately (drone drops).
     """
     def on_press(key):
         if key == keyboard.Key.esc:
-            print('\n[STOP] ESC — stopping mission (controlled landing)')
+            print('\n[STOP] ESC — landing')
             ctrl._stop = True
-            return False   # stop the listener; mission loop handles the rest
-
+            return False
         try:
             if key.char == 'q':
                 print('\n[STOP] Q — cutting motors immediately')
-                ctrl._stop   = True
-                ctrl._killed = True   # tell finally blocks to skip land()
+                ctrl._stop = True
                 ctrl._stop_motors()
                 return False
         except AttributeError:
@@ -1269,10 +1254,9 @@ if __name__ == '__main__':
         print('FPV viewer started')
 
     # Emergency stop listener
-    # threading.Thread(target=emergency_stop_listener,args=(ctrl, cam, cf), daemon=True).start()
-    # emergency_stop_thread = threading.Thread(target=emergency_stop_callback, args=(cf,))
-    emergency_stop_thread = threading.Thread(target=emergency_stop_listener, args=(ctrl, cam, cf), daemon=True)
-    emergency_stop_thread.start()
+    stop_thread = threading.Thread(
+        target=emergency_stop_listener, args=(ctrl, cam, cf), daemon=True)
+    stop_thread.start()
 
     try:
         if MISSION == 'vision':
