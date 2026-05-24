@@ -314,50 +314,12 @@ class FpvViewerThread(threading.Thread):
 
     @staticmethod
     def _detect_overlay(frame):
-        """
-        Re-runs the gate-detection pipeline (independently from the control
-        path) and returns drawable data: the winning rotated rect plus a list
-        of rejected contour rects, so the FPV view can visualize the detector.
-        """
-        bgr = frame if len(frame.shape) == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, GATE_HSV_LOWER, GATE_HSV_UPPER)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((20, 5), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 20), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
-        mask = _fill_holes(mask)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        best_score = 0.0
-        best_rect = None
-        rejected = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 250:
-                continue
-            rect = cv2.minAreaRect(cnt)
-            (_, _), (rw, rh), _ = rect
-            if rw < 10 or rh < 10:
-                continue
-            short_side, long_side = sorted([rw, rh])
-            aspect = short_side / long_side
-            rotated_area = rw * rh
-            rectangularity = area / rotated_area
-            hull_area = cv2.contourArea(cv2.convexHull(cnt))
-            solidity = area / hull_area if hull_area > 0 else 0.0
-            if aspect < 0.45 or rectangularity < 0.80 or solidity < 0.85:
-                rejected.append(rect)
-                continue
-            score = rectangularity * solidity * np.log1p(area)
-            if score > best_score:
-                if best_rect is not None:
-                    rejected.append(best_rect)
-                best_score = score
-                best_rect = rect
-            else:
-                rejected.append(rect)
-        return mask, best_rect, rejected
+        result = get_gate_detection(frame)
+        if result[0] is None:
+            return None, None, []
+        cx, cy, size, lh, rh, box_pts = result
+        rect = ((cx, cy), (size, size), 0)  # synthesize a rect for compatibility
+        return None, rect, []  # no mask, no rejected list
 
     def run(self):
         win = 'Crazyflie FPV'
@@ -823,8 +785,7 @@ class GateController:
         ALIGN_PX = 30   # px — gate must be within this of frame centre to exit
 
         while not self._stop:
-            cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
-
+            cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
             if cx is None:
                 # No gate — keep spinning CCW at fixed rate
                 self._hover(yaw_rate=SEARCH_YAW_RATE, z=CRUISE_ALT)
@@ -860,7 +821,7 @@ class GateController:
         n_detected = 0
         last = None
         while time.time() < t_end and not self._stop:
-            cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
+            cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
             n_ticks += 1
             if cx is not None:
                 n_detected += 1
@@ -906,7 +867,7 @@ class GateController:
         EDGE_MARGIN = 8            # px — gate touching frame edge → don't trust asymmetry
 
         while not self._stop:
-            cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
+            cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
 
             if cx is None:
                 lost += 1
@@ -1028,7 +989,7 @@ class GateController:
         print(f'  [PATROL] flying to waypoint ({wx:.2f}, {wy:.2f})')
         while not self._stop:
             if scan:
-                cx, cy, size, left_h, right_h = get_gate_detection(self._cam.latest_frame)
+                cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
                 if cx is not None:
                     print(f'  [PATROL] gate spotted  cx={cx:.0f}  size={size:.0f}px')
                     return 'found'
@@ -1217,11 +1178,11 @@ class GateController:
 
             # Three colinear waypoints along the flythrough axis: before, centre, after.
             # Pre and post are nudged inward by (bx, by); the centre is not.
-            px, py = self._clamp_to_boundary(gx - PRE_GATE_OFFSET * dirx + bx,
-                                            gy - PRE_GATE_OFFSET * diry + by)
-            cx, cy = self._clamp_to_boundary(gx, gy)
-            qx, qy = self._clamp_to_boundary(gx + POST_GATE_OFFSET * dirx + bx,
-                                            gy + POST_GATE_OFFSET * diry + by)
+            px = gx - PRE_GATE_OFFSET * dirx + bx
+            py = gy - PRE_GATE_OFFSET * diry + by
+            qx = gx + POST_GATE_OFFSET * dirx + bx
+            qy = gy + POST_GATE_OFFSET * diry + by
+            
             waypoints.append((px, py, gz))
             waypoints.append((cx, cy, gz))
             waypoints.append((qx, qy, gz))
