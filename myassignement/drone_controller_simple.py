@@ -72,7 +72,7 @@ logging.basicConfig(level=logging.ERROR)
 
 # ── mission selection ──────────────────────────────────────────────────────────
 
-MISSION = 'vision'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
+MISSION = 'position'   # 'vision' = Part 1 (camera) | 'position' = Part 2 (waypoints)
 
 # ── connection ─────────────────────────────────────────────────────────────────
 
@@ -187,8 +187,8 @@ PRE_GATE_OFFSET  = 0.2   # m — waypoint placed before the gate along its appro
 POST_GATE_OFFSET = 0.2   # m — waypoint placed after the gate (clears the frame)
 
 POSITION_RATE_HZ   = 20.0  # setpoint streaming rate
-WAYPOINT_REACH_TOL = 0.15  # m — final-waypoint reached tolerance
-PURSUIT_LOOKAHEAD  = 0.35  # m — carrot distance ahead of drone along the path
+WAYPOINT_REACH_TOL = 0.1  # m — final-waypoint reached tolerance
+PURSUIT_LOOKAHEAD  = 0.5  # m — carrot distance ahead of drone along the path
                             #     larger = smoother + faster, smaller = tighter tracking
 
 
