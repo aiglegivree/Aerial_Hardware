@@ -97,7 +97,7 @@ FPV_RATE_HZ  = 10     # how often the viewer redraws + re-runs detection
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
-MIN_JPEG_BYTES   = 5000
+MIN_JPEG_BYTES   = 1000
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
@@ -115,7 +115,7 @@ MAX_VX       = 0.10    # m/s — forward cap (never backward)
 MAX_VY       = 0.10   # m/s — strafe cap
 MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
-TRANSIT_VX   = 0.5    # m/s
+TRANSIT_VX   = 0.10    # m/s
 TRANSIT_TIME = 2.0    # s
 
 SEARCH_YAW_RATE   = 15.0  # deg/s — yaw cap used by patrol waypointing
