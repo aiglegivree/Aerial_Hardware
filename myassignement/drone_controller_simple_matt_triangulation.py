@@ -106,6 +106,8 @@ SPEED_THRESHOLD  = 0.10      # m/s
 APPROACH_DIST    = 0.4       # m, pre-gate waypoint offset
 EXIT_DIST        = 0.3       # m, post-gate waypoint offset (short → next search starts close to gate)
 PASS_TOLERANCE   = 0.15      # m, waypoint-reached tolerance
+TRAVEL_STEP      = 0.07      # m, max carrot distance per setpoint during TRAVEL_GATE (smaller = slower)
+TRAVEL_SETTLE_S  = 0.8       # s, hold at pre-gate point before going through
 LOST_THRESHOLD   = 20        # fresh misses before bailing back to SEARCH
 N_GATES          = 5
 
@@ -172,6 +174,7 @@ class UdpVideoThread(threading.Thread):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
             sock.bind(('0.0.0.0', UDP_LOCAL_PORT))
+            sock.settimeout(2.0)
             sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
             print(f'[UDP] bound :{UDP_LOCAL_PORT}, sent START to {UDP_AIDECK_IP}:{UDP_AIDECK_PORT}')
         except Exception as e:
@@ -181,9 +184,22 @@ class UdpVideoThread(threading.Thread):
         buffer = bytearray()
         expected_size = 0
         receiving = False
+        last_rearm = time.time()
 
         while True:
-            data, _ = sock.recvfrom(2048)
+            try:
+                data, _ = sock.recvfrom(2048)
+            except socket.timeout:
+                # No packets for 2 s → AI-deck may have stopped streaming.
+                # Re-send START_MAGIC (rate-limited) and keep waiting.
+                if time.time() - last_rearm > 3.0:
+                    try:
+                        sock.sendto(UDP_START_MAGIC, (UDP_AIDECK_IP, UDP_AIDECK_PORT))
+                        last_rearm = time.time()
+                        print('[UDP] no packets for 2s — re-sent START')
+                    except Exception as e:
+                        print(f'[UDP] re-arm failed: {e!r}')
+                continue
             if len(data) < CPX_HEADER_SIZE:
                 continue
             payload = data[CPX_HEADER_SIZE:]
@@ -461,13 +477,17 @@ class GateController:
         # LATERAL_MOVE target + settle timer
         self._lat_x = self._lat_y = self._lat_z = 0.0
         self._lat_settle_start = None
+        # TRAVEL_GATE pre-gate settle timer
+        self._travel_settle_start = None
 
         self._setup_log()
 
     # ── log setup ────────────────────────────────────────────────────────────
 
     def _setup_log(self):
-        lg1 = LogConfig(name='PosVel', period_in_ms=50)
+        # 10 Hz log streams — half of what we had before, to keep CRTP load
+        # well under the 2 Mbit radio budget alongside 20 Hz setpoints.
+        lg1 = LogConfig(name='PosVel', period_in_ms=100)
         lg1.add_variable('stateEstimate.x',  'float')
         lg1.add_variable('stateEstimate.y',  'float')
         lg1.add_variable('stateEstimate.z',  'float')
@@ -475,7 +495,7 @@ class GateController:
         lg1.add_variable('stateEstimate.vy', 'float')
         lg1.add_variable('stateEstimate.vz', 'float')
 
-        lg2 = LogConfig(name='Att', period_in_ms=50)
+        lg2 = LogConfig(name='Att', period_in_ms=100)
         lg2.add_variable('stabilizer.yaw',   'float')
         lg2.add_variable('stateEstimate.qx', 'float')
         lg2.add_variable('stateEstimate.qy', 'float')
@@ -704,10 +724,18 @@ class GateController:
         mission_state = SEARCH
         print(f'[{SEARCH}]')
 
+        # Only states that actually use detections pay the CV cost. Other
+        # states (LATERAL_MOVE, TRAVEL_GATE, TRIANGULATE, DONE) just skip
+        # the detector to keep the loop snappy.
+        DETECTION_STATES = {SEARCH, DETECT_1, DETECT_2}
+
         try:
             while not self._stop:
-                s   = self._state()
-                det = self._poll_detection()
+                s = self._state()
+                if mission_state in DETECTION_STATES:
+                    det = self._poll_detection()
+                else:
+                    det = None
                 status, quad_norm, _quad_pix = det if det is not None else (None, None, None)
 
                 # ── SEARCH ───────────────────────────────────────────────────
@@ -751,29 +779,23 @@ class GateController:
                                 self._qn1 = quad_norm.copy()
                                 self._frames_detected = 0
 
-                                yaw_r = math.radians(s['yaw'])
-                                # body-left and body-right candidates in world frame
-                                bl = (s['x'] + LATERAL_DIST * -math.sin(yaw_r),
-                                      s['y'] + LATERAL_DIST *  math.cos(yaw_r))
-                                br = (s['x'] + LATERAL_DIST *  math.sin(yaw_r),
-                                      s['y'] + LATERAL_DIST * -math.cos(yaw_r))
-                                # Score each candidate: arena margin minus a
-                                # penalty for being outside the patrol annulus.
-                                def _score(p):
-                                    x, y = p
-                                    arena_m = min(x - ARENA_X_MIN, ARENA_X_MAX - x,
-                                                  y - ARENA_Y_MIN, ARENA_Y_MAX - y)
-                                    r = math.hypot(x - ARENA_CENTER_X, y - ARENA_CENTER_Y)
-                                    if r < PATROL_R_MIN:
-                                        annulus_pen = (PATROL_R_MIN - r) * 5.0
-                                    elif r > PATROL_R_MAX:
-                                        annulus_pen = (r - PATROL_R_MAX) * 5.0
-                                    else:
-                                        annulus_pen = 0.0
-                                    return arena_m - annulus_pen
-                                target = bl if _score(bl) >= _score(br) else br
-                                # Project onto the patrol annulus, then clamp
-                                # to the rectangular arena as a final safety.
+                                # Move along the RADIAL axis (toward or away
+                                # from arena centre) — keeps us on the same
+                                # patrol arc and gives a clean triangulation
+                                # baseline. Go outward by default; only go
+                                # inward if we're already past the annulus
+                                # midpoint, so we never crowd the centre.
+                                dx_r = s['x'] - ARENA_CENTER_X
+                                dy_r = s['y'] - ARENA_CENTER_Y
+                                r_now = math.hypot(dx_r, dy_r)
+                                if r_now < 1e-3:
+                                    ux, uy = 1.0, 0.0
+                                else:
+                                    ux, uy = dx_r / r_now, dy_r / r_now
+                                r_mid = (PATROL_R_MIN + PATROL_R_MAX) / 2.0
+                                sign = -1.0 if r_now > r_mid else +1.0
+                                target = (s['x'] + sign * LATERAL_DIST * ux,
+                                          s['y'] + sign * LATERAL_DIST * uy)
                                 target = _project_to_annulus(*target)
                                 self._lat_x, self._lat_y = _clamp_to_arena(*target)
                                 self._lat_z = CRUISE_ALT
@@ -781,8 +803,10 @@ class GateController:
                                 mission_state = LATERAL_MOVE
                                 r_target = math.hypot(self._lat_x - ARENA_CENTER_X,
                                                       self._lat_y - ARENA_CENTER_Y)
-                                print(f'[{LATERAL_MOVE}] to ({self._lat_x:.2f},{self._lat_y:.2f}) '
-                                      f'r={r_target:.2f}m')
+                                direction = 'outward' if sign > 0 else 'inward'
+                                print(f'[{LATERAL_MOVE}] {direction} '
+                                      f'r {r_now:.2f}→{r_target:.2f}m '
+                                      f'to ({self._lat_x:.2f},{self._lat_y:.2f})')
                         else:
                             self._frames_detected = 0
                     elif status in ('no_gate', 'no_corners'):
@@ -875,17 +899,47 @@ class GateController:
                 # ── TRAVEL_GATE ──────────────────────────────────────────────
                 elif mission_state == TRAVEL_GATE:
                     gyd = math.degrees(self._gate_yaw)
+
+                    def _carrot_to(tx, ty, tz):
+                        """Send a position setpoint at most TRAVEL_STEP m
+                        ahead of the drone toward (tx, ty, tz). Returns the
+                        remaining distance so the caller can decide when to
+                        advance to the next phase."""
+                        dx = tx - s['x']
+                        dy = ty - s['y']
+                        dist = math.hypot(dx, dy)
+                        if dist < 1e-3:
+                            self._send(tx, ty, tz, gyd)
+                        else:
+                            step = min(TRAVEL_STEP, dist)
+                            self._send(s['x'] + step * dx / dist,
+                                       s['y'] + step * dy / dist,
+                                       tz, gyd)
+                        return dist
+
                     if self._travel_phase == 0:
-                        self._send(self._app_x, self._app_y, self._gate_z, gyd)
-                        if self._dist3(s, self._app_x, self._app_y, self._gate_z) < PASS_TOLERANCE:
-                            self._travel_phase = 1
+                        # APPROACH — carrot toward pre-gate point, then SETTLE
+                        # there before going through (drone must actually stop).
+                        dist = _carrot_to(self._app_x, self._app_y, self._gate_z)
+                        if dist < PASS_TOLERANCE:
+                            if self._travel_settle_start is None:
+                                self._travel_settle_start = time.time()
+                                print('  [TRAVEL] at pre-gate, settling…')
+                            elif time.time() - self._travel_settle_start >= TRAVEL_SETTLE_S:
+                                self._travel_settle_start = None
+                                self._travel_phase = 1
+                                print('  [TRAVEL] settled → going through')
+                        else:
+                            self._travel_settle_start = None
                     elif self._travel_phase == 1:
-                        self._send(self._mid_x, self._mid_y, self._gate_z, gyd)
-                        if self._dist3(s, self._mid_x, self._mid_y, self._gate_z) < PASS_TOLERANCE:
+                        # GO THROUGH — carrot toward gate centre, no settle
+                        dist = _carrot_to(self._mid_x, self._mid_y, self._gate_z)
+                        if dist < PASS_TOLERANCE:
                             self._travel_phase = 2
                     elif self._travel_phase == 2:
-                        self._send(self._exit_x, self._exit_y, self._gate_z, gyd)
-                        if self._dist3(s, self._exit_x, self._exit_y, self._gate_z) < PASS_TOLERANCE:
+                        # EXIT — carrot to post-gate point
+                        dist = _carrot_to(self._exit_x, self._exit_y, self._gate_z)
+                        if dist < PASS_TOLERANCE:
                             self._gate_count += 1
                             print(f'Gate {self._gate_count} passed!')
                             self._hold_x, self._hold_y = s['x'], s['y']
