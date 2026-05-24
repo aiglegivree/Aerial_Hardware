@@ -178,9 +178,9 @@ NO_GATE_WAYPOINTS = []
 #
 # Fill GATE_POSITIONS once the instructor gives you the exact gate positions.
 # Each gate entry will be (x, y, z, theta, height, width)
-GATE_POSITIONS = [    (0.65, -0.74, 1.28, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.78, -0.92, 1.13, np.deg2rad(100), 0.29, GATE_HEIGHT),
-    (2.22, 0.05, 1.42, np.deg2rad(188), 0.4, GATE_HEIGHT), (1.52, 0.83, 1.17, np.deg2rad(233), 0.4, GATE_HEIGHT),
-    (0.51, 0.9, 1.28, np.deg2rad(280), 0.29, GATE_HEIGHT)]
+GATE_POSITIONS = [    (0.5, -0.7, 1.2, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.7, -0.75, 1.35, np.deg2rad(115), 0.29, GATE_HEIGHT),
+    (2.5, 0.08, 1.43, np.deg2rad(158), 0.4, GATE_HEIGHT), (1.6, 0.9, 1.3, np.deg2rad(244), 0.4, GATE_HEIGHT),
+    (0.55, 0.95, 1.3, np.deg2rad(288), 0.29, GATE_HEIGHT)]
 
 N_LAPS           = 2     # number of timed laps
 PRE_GATE_OFFSET  = 0.2   # m — waypoint placed before the gate along its approach axis
