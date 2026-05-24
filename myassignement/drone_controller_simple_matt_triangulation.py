@@ -82,6 +82,14 @@ ARENA_Y_MIN = -0.9
 ARENA_Y_MAX = +0.9
 SAFETY_MARGIN_HARD = 0.0
 
+# Patrol annulus: keep the drone between PATROL_R_MIN and PATROL_R_MAX
+# from the arena centre (where the gates sit on a rough circle). The lateral
+# detection waypoint is projected onto this ring.
+ARENA_CENTER_X = 1.0
+ARENA_CENTER_Y = 0.0
+PATROL_R_MIN   = 0.9
+PATROL_R_MAX   = 1.2
+
 # ── flight ─────────────────────────────────────────────────────────────────────
 
 CRUISE_ALT       = 1.2
@@ -96,7 +104,7 @@ LATERAL_SETTLE_S = 1.0       # s, hold at lateral target before starting DETECT_
 REQ_FRAMES       = 5         # consecutive stationary hits to commit a view
 SPEED_THRESHOLD  = 0.10      # m/s
 APPROACH_DIST    = 0.4       # m, pre-gate waypoint offset
-EXIT_DIST        = 0.4       # m, post-gate waypoint offset
+EXIT_DIST        = 0.3       # m, post-gate waypoint offset (short → next search starts close to gate)
 PASS_TOLERANCE   = 0.15      # m, waypoint-reached tolerance
 LOST_THRESHOLD   = 20        # fresh misses before bailing back to SEARCH
 N_GATES          = 5
@@ -345,6 +353,26 @@ def clamp(v, lo, hi):
 def _clamp_to_arena(x, y):
     return (clamp(x, ARENA_X_MIN + SAFETY_MARGIN_HARD, ARENA_X_MAX - SAFETY_MARGIN_HARD),
             clamp(y, ARENA_Y_MIN + SAFETY_MARGIN_HARD, ARENA_Y_MAX - SAFETY_MARGIN_HARD))
+
+
+def _project_to_annulus(x, y):
+    """Push (x, y) onto the patrol annulus around the arena centre. Points
+    inside PATROL_R_MIN are pushed outward, points outside PATROL_R_MAX are
+    pulled inward. Points already in the annulus are returned unchanged.
+    If (x, y) is exactly at the centre, returns a point at r=PATROL_R_MIN
+    along +x as a safe default."""
+    dx = x - ARENA_CENTER_X
+    dy = y - ARENA_CENTER_Y
+    r  = math.hypot(dx, dy)
+    if r < 1e-3:
+        return (ARENA_CENTER_X + PATROL_R_MIN, ARENA_CENTER_Y)
+    if r < PATROL_R_MIN:
+        s = PATROL_R_MIN / r
+    elif r > PATROL_R_MAX:
+        s = PATROL_R_MAX / r
+    else:
+        return (x, y)
+    return (ARENA_CENTER_X + dx * s, ARENA_CENTER_Y + dy * s)
 
 
 def _quad_mean_side(quad):
@@ -729,16 +757,32 @@ class GateController:
                                       s['y'] + LATERAL_DIST *  math.cos(yaw_r))
                                 br = (s['x'] + LATERAL_DIST *  math.sin(yaw_r),
                                       s['y'] + LATERAL_DIST * -math.cos(yaw_r))
-                                def _margin(p):
+                                # Score each candidate: arena margin minus a
+                                # penalty for being outside the patrol annulus.
+                                def _score(p):
                                     x, y = p
-                                    return min(x - ARENA_X_MIN, ARENA_X_MAX - x,
-                                               y - ARENA_Y_MIN, ARENA_Y_MAX - y)
-                                target = bl if _margin(bl) >= _margin(br) else br
+                                    arena_m = min(x - ARENA_X_MIN, ARENA_X_MAX - x,
+                                                  y - ARENA_Y_MIN, ARENA_Y_MAX - y)
+                                    r = math.hypot(x - ARENA_CENTER_X, y - ARENA_CENTER_Y)
+                                    if r < PATROL_R_MIN:
+                                        annulus_pen = (PATROL_R_MIN - r) * 5.0
+                                    elif r > PATROL_R_MAX:
+                                        annulus_pen = (r - PATROL_R_MAX) * 5.0
+                                    else:
+                                        annulus_pen = 0.0
+                                    return arena_m - annulus_pen
+                                target = bl if _score(bl) >= _score(br) else br
+                                # Project onto the patrol annulus, then clamp
+                                # to the rectangular arena as a final safety.
+                                target = _project_to_annulus(*target)
                                 self._lat_x, self._lat_y = _clamp_to_arena(*target)
                                 self._lat_z = CRUISE_ALT
                                 self._lat_settle_start = None
                                 mission_state = LATERAL_MOVE
-                                print(f'[{LATERAL_MOVE}] to ({self._lat_x:.2f},{self._lat_y:.2f})')
+                                r_target = math.hypot(self._lat_x - ARENA_CENTER_X,
+                                                      self._lat_y - ARENA_CENTER_Y)
+                                print(f'[{LATERAL_MOVE}] to ({self._lat_x:.2f},{self._lat_y:.2f}) '
+                                      f'r={r_target:.2f}m')
                         else:
                             self._frames_detected = 0
                     elif status in ('no_gate', 'no_corners'):
