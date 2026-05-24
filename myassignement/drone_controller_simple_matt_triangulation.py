@@ -82,7 +82,9 @@ LAND_DURATION    = 3.0
 SETPOINT_PERIOD  = 0.05      # 20 Hz
 
 SEARCH_YAW_RATE  = 10.0      # deg/s, CCW target-yaw increment
-LATERAL_DIST     = 0.5       # m, body +y strafe between views
+LATERAL_DIST     = 0.5       # m, sideways baseline between views (direction auto-picked)
+LATERAL_STEP     = 0.07      # m, max carrot distance per setpoint during lateral move (smaller = slower)
+LATERAL_SETTLE_S = 1.0       # s, hold at lateral target before starting DETECT_2
 REQ_FRAMES       = 5         # consecutive stationary hits to commit a view
 SPEED_THRESHOLD  = 0.10      # m/s
 APPROACH_DIST    = 0.4       # m, pre-gate waypoint offset
@@ -98,8 +100,11 @@ GATE_HEIGHT_TOL  = 0.15
 
 SIZE_RATIO_MIN          = 0.5
 SIZE_RATIO_MAX          = 2.0
-BEARING_SHIFT_MIN_FRAC  = 0.3
-BEARING_SHIFT_MAX_FRAC  = 3.0
+
+# Rectangularity filter applied to every detection before it is used
+RECT_MIN_SIDE_PX        = 10
+RECT_OPPOSITE_RATIO     = 2.0   # opposite sides within this factor of each other
+RECT_MIN_ASPECT         = 0.4   # min(W,H)/max(W,H)
 
 R_CAM_TO_BODY = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=float)
 
@@ -298,6 +303,28 @@ def _quad_mean_side(quad):
     return s / 4.0
 
 
+def _is_rectangular(quad_pix):
+    """True if quad_pix looks roughly rectangular (gate-like). Rejects
+    degenerate, sliver, or very skewed quads. Corners assumed ordered
+    TL → TR → BR → BL by cv_detection.order_corners."""
+    top    = float(np.linalg.norm(quad_pix[1] - quad_pix[0]))
+    right  = float(np.linalg.norm(quad_pix[2] - quad_pix[1]))
+    bottom = float(np.linalg.norm(quad_pix[3] - quad_pix[2]))
+    left   = float(np.linalg.norm(quad_pix[0] - quad_pix[3]))
+    if min(top, right, bottom, left) < RECT_MIN_SIDE_PX:
+        return False
+    if not (1.0 / RECT_OPPOSITE_RATIO) <= (top / bottom) <= RECT_OPPOSITE_RATIO:
+        return False
+    if not (1.0 / RECT_OPPOSITE_RATIO) <= (left / right) <= RECT_OPPOSITE_RATIO:
+        return False
+    width  = (top + bottom) / 2.0
+    height = (left + right) / 2.0
+    aspect = min(width, height) / max(width, height)
+    if aspect < RECT_MIN_ASPECT:
+        return False
+    return True
+
+
 # ── flight controller ──────────────────────────────────────────────────────────
 
 class GateController:
@@ -352,8 +379,9 @@ class GateController:
         # SEARCH yaw target accumulator (deg)
         self._search_yaw_deg = 0.0
 
-        # LATERAL_MOVE target
+        # LATERAL_MOVE target + settle timer
         self._lat_x = self._lat_y = self._lat_z = 0.0
+        self._lat_settle_start = None
 
         self._setup_log()
 
@@ -440,6 +468,12 @@ class GateController:
         quad_pix  = res['quad_pix']
         quad_norm = res['quad_norm']
 
+        # Reject non-rectangular quads. cv_detection still drew them, so we
+        # keep last_quad_pix for the FPV overlay but downgrade the status so
+        # the state machine treats it as 'no usable detection'.
+        if status == 'ok' and quad_pix is not None and not _is_rectangular(quad_pix):
+            status = 'no_corners'
+
         self.last_quad_pix = quad_pix
         return (status, quad_norm, quad_pix)
 
@@ -477,7 +511,13 @@ class GateController:
         return corners_3d, H, gate_yaw
 
     def _check_same_gate(self):
-        """Cheap consistency tests between view-1 and view-2 quads."""
+        """Cheap consistency test between view-1 and view-2 quads.
+
+        Only checks size ratio — the previous bearing-shift sign/magnitude
+        test assumed yaw was held constant between views, which it isn't
+        (we yaw-track to keep the gate centred). Triangulation's gate-height
+        check still catches gross mismatches.
+        """
         q1, q2 = self._qn1, self._qn2
 
         size1 = _quad_mean_side(q1)
@@ -487,25 +527,6 @@ class GateController:
         ratio = size2 / size1
         if not (SIZE_RATIO_MIN <= ratio <= SIZE_RATIO_MAX):
             return False, f'size ratio {ratio:.2f} outside [{SIZE_RATIO_MIN},{SIZE_RATIO_MAX}]'
-
-        cx1 = float(np.mean(q1[:, 0]))
-        cx2 = float(np.mean(q2[:, 0]))
-        y_span1 = float(np.max(q1[:, 1]) - np.min(q1[:, 1]))
-        if y_span1 < 1e-4:
-            return False, 'degenerate y-span'
-        est_dist = GATE_HEIGHT_REAL / y_span1
-        expected_shift = LATERAL_DIST / max(est_dist, 1e-3)
-
-        # LATERAL_MOVE goes body +y → gate appears to move LEFT → cx decreases.
-        actual = cx2 - cx1
-        if actual >= 0:
-            return False, f'bearing shift wrong direction (Δcx={actual:+.3f})'
-        mag = abs(actual)
-        lo = BEARING_SHIFT_MIN_FRAC * expected_shift
-        hi = BEARING_SHIFT_MAX_FRAC * expected_shift
-        if mag < lo or mag > hi:
-            return False, (f'bearing shift {mag:.3f} outside '
-                           f'[{lo:.3f},{hi:.3f}] (est_dist={est_dist:.2f}m)')
 
         return True, ''
 
@@ -652,10 +673,19 @@ class GateController:
                                 self._frames_detected = 0
 
                                 yaw_r = math.radians(s['yaw'])
-                                self._lat_x = s['x'] + LATERAL_DIST *  math.sin(yaw_r)
-                                self._lat_y = s['y'] + LATERAL_DIST * -math.cos(yaw_r)
-                                self._lat_x, self._lat_y = _clamp_to_arena(self._lat_x, self._lat_y)
+                                # body-left and body-right candidates in world frame
+                                bl = (s['x'] + LATERAL_DIST * -math.sin(yaw_r),
+                                      s['y'] + LATERAL_DIST *  math.cos(yaw_r))
+                                br = (s['x'] + LATERAL_DIST *  math.sin(yaw_r),
+                                      s['y'] + LATERAL_DIST * -math.cos(yaw_r))
+                                def _margin(p):
+                                    x, y = p
+                                    return min(x - ARENA_X_MIN, ARENA_X_MAX - x,
+                                               y - ARENA_Y_MIN, ARENA_Y_MAX - y)
+                                target = bl if _margin(bl) >= _margin(br) else br
+                                self._lat_x, self._lat_y = _clamp_to_arena(*target)
                                 self._lat_z = CRUISE_ALT
+                                self._lat_settle_start = None
                                 mission_state = LATERAL_MOVE
                                 print(f'[{LATERAL_MOVE}] to ({self._lat_x:.2f},{self._lat_y:.2f})')
                         else:
@@ -669,13 +699,30 @@ class GateController:
 
                 # ── LATERAL_MOVE ─────────────────────────────────────────────
                 elif mission_state == LATERAL_MOVE:
-                    self._send(self._lat_x, self._lat_y, self._lat_z, self._hold_yaw)
-                    if self._dist3(s, self._lat_x, self._lat_y, self._lat_z) < PASS_TOLERANCE:
-                        self._hold_x, self._hold_y = self._lat_x, self._lat_y
-                        self._frames_detected = 0
-                        self._lost_count = 0
-                        mission_state = DETECT_2
-                        print(f'[{DETECT_2}]')
+                    dx = self._lat_x - s['x']
+                    dy = self._lat_y - s['y']
+                    dist = math.hypot(dx, dy)
+                    if dist < PASS_TOLERANCE:
+                        # Arrived — hold the final target and let oscillations
+                        # die down for LATERAL_SETTLE_S before sampling DETECT_2.
+                        self._send(self._lat_x, self._lat_y, self._lat_z, self._hold_yaw)
+                        if self._lat_settle_start is None:
+                            self._lat_settle_start = time.time()
+                        elif time.time() - self._lat_settle_start >= LATERAL_SETTLE_S:
+                            self._hold_x, self._hold_y = self._lat_x, self._lat_y
+                            self._frames_detected = 0
+                            self._lost_count = 0
+                            mission_state = DETECT_2
+                            print(f'[{DETECT_2}]')
+                    else:
+                        # Carrot setpoint: at most LATERAL_STEP m ahead of the
+                        # drone toward the target. Keeps firmware velocity ramp
+                        # short → smooth, slow, no overshoot.
+                        self._lat_settle_start = None
+                        step = min(LATERAL_STEP, dist)
+                        cx_t = s['x'] + step * dx / dist
+                        cy_t = s['y'] + step * dy / dist
+                        self._send(cx_t, cy_t, self._lat_z, self._hold_yaw)
 
                 # ── DETECT_2 ─────────────────────────────────────────────────
                 elif mission_state == DETECT_2:
