@@ -14,7 +14,7 @@ DIST = np.array([-5.56509139e-01, 1.36094480e+00, 3.25533387e-02,
 
 # ── preprocessing ──────────────────────────────────────────────────────────────
 
-def preprocess_fill(gray, threshold=200,
+def preprocess_fill(gray, threshold=230,
                     close_short=5, close_long=20,
                     dilate_extra=3, open_size=3):
     """
