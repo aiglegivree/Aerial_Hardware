@@ -105,6 +105,8 @@ CRUISE_ALT       = 1.25  # m ## The height position of the drone
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
+MAX_VZ_STEP = 0.005
+
 # IBVS gains — tune these on the real drone
 KP_VX        = 0.010  # size error  (GATE_SIZE_CLOSE - size) → forward speed
 KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
@@ -828,17 +830,21 @@ class GateController:
 
             # ── Step 3: proportional control ────────────────────────────────
             v_strafe  = KP_VY * e_x
-            v_climb   = KP_VZ * e_y
             v_forward = KP_VX * e_z
 
-            # ── Step 4: clamp to safe speed limits ──────────────────────────
+            # ── Step 4: clamp horizontal speeds ─────────────────────────────
             v_strafe  = clamp(v_strafe,  -MAX_VY,  MAX_VY)
-            v_climb   = clamp(v_climb,   -MAX_VZ_DELTA, MAX_VZ_DELTA)
             v_forward = clamp(v_forward,  0.0,     MAX_VX)   # never fly backward
 
-            target_z  = clamp(CRUISE_ALT + v_climb,
-                              CRUISE_ALT - MAX_VZ_DELTA,
-                              CRUISE_ALT + MAX_VZ_DELTA)
+            # ── Step 4b: rate-limited altitude update ───────────────────────
+            # Compute where the pixel error WANTS target_z to be, then move
+            # current target_z toward it by at most MAX_VZ_STEP per tick.
+            desired_dz = clamp(KP_VZ * e_y, -MAX_VZ_DELTA, MAX_VZ_DELTA)
+            target_z_desired = clamp(CRUISE_ALT + desired_dz,
+                                     CRUISE_ALT - MAX_VZ_DELTA,
+                                     CRUISE_ALT + MAX_VZ_DELTA)
+            dz_step = clamp(target_z_desired - target_z, -MAX_VZ_STEP, MAX_VZ_STEP)
+            target_z += dz_step
 
             print(f'  [IBVS] ex={e_x:+.0f}px ey={e_y:+.0f}px size={size:.0f}px'
                   f'  → vx={v_forward:.2f} vy={v_strafe:+.2f} z={target_z:.2f}')
