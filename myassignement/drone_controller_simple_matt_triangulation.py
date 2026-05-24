@@ -85,10 +85,16 @@ SAFETY_MARGIN_HARD = 0.0
 # Patrol annulus: keep the drone between PATROL_R_MIN and PATROL_R_MAX
 # from the arena centre (where the gates sit on a rough circle). The lateral
 # detection waypoint is projected onto this ring.
-ARENA_CENTER_X = 1.0
+#
+# Centre is 1.2 m forward of the drone's starting position (0, 0). The gates
+# themselves sit at r ≈ 0.9–1.15 m from the centre, so the annulus is set a
+# little wider on the OUTSIDE (up to 1.6 m) so the drone can stand clearly
+# outside the ring for triangulation, and slightly inside (1.0 m) so we
+# never dip into the gate plane during patrol.
+ARENA_CENTER_X = 1.2
 ARENA_CENTER_Y = 0.0
-PATROL_R_MIN   = 0.9
-PATROL_R_MAX   = 1.2
+PATROL_R_MIN   = 1.0
+PATROL_R_MAX   = 1.6
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
