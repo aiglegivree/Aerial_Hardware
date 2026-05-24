@@ -182,13 +182,13 @@ GATE_POSITIONS = [    (0.5, -0.7, 1.2, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.7, 
     (2.5, 0.08, 1.43, np.deg2rad(158), 0.4, GATE_HEIGHT), (1.6, 0.9, 1.3, np.deg2rad(244), 0.4, GATE_HEIGHT),
     (0.55, 0.95, 1.3, np.deg2rad(286), 0.29, GATE_HEIGHT)]
 
-N_LAPS           = 2     # number of timed laps
-PRE_GATE_OFFSET  = 0.3   # m — waypoint placed before the gate along its approach axis
-POST_GATE_OFFSET = 0.3   # m — waypoint placed after the gate (clears the frame)
+N_LAPS           = 1     # number of timed laps
+PRE_GATE_OFFSET  = 0.35   # m — waypoint placed before the gate along its approach axis
+POST_GATE_OFFSET = 0.35   # m — waypoint placed after the gate (clears the frame)
 
-POSITION_RATE_HZ   = 20.0  # setpoint streaming rate
-WAYPOINT_REACH_TOL = 0.15  # m — final-waypoint reached tolerance
-PURSUIT_LOOKAHEAD  = 0.35  # m — carrot distance ahead of drone along the path
+POSITION_RATE_HZ   = 25.0  # setpoint streaming rate
+WAYPOINT_REACH_TOL = 0.1  # m — final-waypoint reached tolerance
+PURSUIT_LOOKAHEAD  = 0.4  # m — carrot distance ahead of drone along the path
                             #     larger = smoother + faster, smaller = tighter tracking
 
 
@@ -1397,10 +1397,10 @@ if __name__ == '__main__':
     emergency_stop_thread.start()
 
     try:
-        if MISSION == 'vision':
+        if MISSION == 'position':
             ctrl.run_vision_lap()
         else:
-            ctrl.run_fast_lap(GATE_POSITIONS, N_LAPS)
+            ctrl.run_fast_lap(GATE_POSITIONS*2, 1)
     finally:
         if fpv_q is not None:
             try:

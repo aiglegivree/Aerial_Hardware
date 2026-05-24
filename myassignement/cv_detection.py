@@ -14,7 +14,7 @@ DIST = np.array([-5.56509139e-01, 1.36094480e+00, 3.25533387e-02,
 
 # ── preprocessing ──────────────────────────────────────────────────────────────
 
-def preprocess_fill(gray, threshold=200,
+def preprocess_fill(gray, threshold=230,
                     close_short=5, close_long=20,
                     dilate_extra=3, open_size=3):
     """
@@ -62,6 +62,30 @@ def order_corners(c):
     tl, tr = top[np.argsort(top[:, 0])]
     bl, br = bot[np.argsort(bot[:, 0])]
     return np.array([tl, tr, br, bl])
+
+
+def find_corners_polydp(contour, eps_min=0.01, eps_max=0.10, n_steps=20):
+    """Adaptive approxPolyDP: walk epsilon from eps_min*perimeter up to
+    eps_max*perimeter until the approximation has exactly 4 vertices.
+
+    Returns (corners (4,2) float32, approx_used) or (None, None).
+    Robust to small horns/specks on the contour — they get folded into an
+    edge once epsilon clears their bump size.
+    """
+    peri = cv2.arcLength(contour, True)
+    if peri < 1e-3:
+        return None, None
+    best4 = None
+    for f in np.linspace(eps_min, eps_max, n_steps):
+        approx = cv2.approxPolyDP(contour, f * peri, True)
+        n = len(approx)
+        if n == 4:
+            best4 = approx.reshape(-1, 2).astype(np.float32)
+            break
+        if n < 4:
+            # overshot — epsilon too large, no point going further
+            break
+    return best4, best4
 
 
 def find_corners_by_curvature(curve, n_corners=4,
@@ -172,11 +196,9 @@ def detect_gate(gray, k=K, dist_coeffs=DIST,
     contour, _ = max(accepted, key=lambda x: x[1])
     result['selected'] = contour
 
-    corners, smoothed, curv = find_corners_by_curvature(
-        contour, 4, smooth_sigma=smooth_sigma,
-        window_frac=window_frac, nms_frac=nms_frac)
-    result['smoothed']  = smoothed
-    result['curvature'] = curv
+    corners, approx = find_corners_polydp(contour)
+    result['smoothed']  = approx   # reuse key for FPV-style overlay
+    result['curvature'] = None
 
     if corners is None:
         result['status'] = 'no_corners'
