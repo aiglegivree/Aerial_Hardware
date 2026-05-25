@@ -108,11 +108,11 @@ LAND_DURATION    = 3.0   # s
 MAX_VZ_STEP = 0.005
 
 # IBVS gains — tune these on the real drone
-KP_VX        = 0.005  # size error  (GATE_SIZE_CLOSE - size) → forward speed
-KP_VY        = 0.005  # lateral pixel error (cx - cx_mid)    → strafe speed
-KP_VZ        = 0.005  # vertical pixel error (cy_mid - cy)   → altitude delta
-MAX_VX       = 0.10    # m/s — forward cap (never backward)
-MAX_VY       = 0.10   # m/s — strafe cap
+KP_VX        = 0.012  # size error  (GATE_SIZE_CLOSE - size) → forward speed
+KP_VY        = 0.008  # lateral pixel error (cx - cx_mid)    → strafe speed
+KP_VZ        = 0.008  # vertical pixel error (cy_mid - cy)   → altitude delta
+MAX_VX       = 0.20    # m/s — forward cap (never backward)
+MAX_VY       = 0.20   # m/s — strafe cap
 MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
 ALIGN_TOL_ARM    = 0.10  # arm forward motion when |asymmetry| below this
@@ -124,10 +124,10 @@ KP_YAW_ALIGN   = 8.0   # deg/s per unit-asymmetry; max yaw = KP × 1.0
 MAX_YAW_ALIGN  = 8.0   # deg/s — hard cap on alignment yaw rate
 ALIGN_DEADBAND = 0.08  # |asymmetry| below this is treated as head-on (no yaw)
 
-CENTER_TOL_PX = 20  # px — gate must be within this of frame centre before approaching
+CENTER_TOL_PX = 40  # px — gate must be within this of frame centre before approaching
 
 TRANSIT_VX   = 0.10    # m/s
-TRANSIT_TIME = 5.0    # s
+TRANSIT_TIME = 10.0    # s
 
 SEARCH_YAW_RATE   = 10.0  # deg/s — yaw cap used by patrol waypointing
 SEARCH_SWEEP_RATE = 7.0   # deg/s — peak yaw rate during yaw sweep
@@ -773,38 +773,55 @@ class GateController:
 
     # ── state: SEARCH ────────────────────────────────────────────────────────
 
-    def search_for_gate(self):
+    def search_for_gate(self, timeout_s=15.0):
         """
-        Matt-style search: continuous CCW rotation at SEARCH_YAW_RATE deg/s.
-        Once a gate is spotted, stop spinning and proportionally yaw to centre
-        it in the frame before returning — so lock_on_gate starts with the gate
-        already roughly centred, not at some random edge position.
+        Rotate CCW looking for a gate. When a gate is briefly seen, keep yawing
+        toward its last-known position through detection dropouts, instead of
+        falling back to the default CCW spin (which would yaw past the gate).
         """
         print('  [SEARCH] rotating CCW...')
-        cx_mid   = CAM_WIDTH / 2.0
-        ALIGN_PX = 30   # px — gate must be within this of frame centre to exit
+        cx_mid = CAM_WIDTH / 2.0
+        ALIGN_PX = 50
+        
+        t_start         = time.time()
+        last_seen_t     = 0.0
+        last_yaw_cmd    = SEARCH_YAW_RATE   # default: keep sweeping CCW
+        MEMORY_WINDOW_S = 1.5                # within this window after last detection,
+                                            # hold the previous yaw command
 
         while not self._stop:
+            if time.time() - t_start > timeout_s:
+                print(f'  [SEARCH] timeout after {timeout_s:.0f}s — no gate found')
+                return False
+            
             cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
-            if cx is None:
-                # No gate — keep spinning CCW at fixed rate
-                self._hover(yaw_rate=SEARCH_YAW_RATE, z=CRUISE_ALT)
-            else:
-                # Gate found: e_x > 0 → gate left of centre → yaw CCW (positive)
-                #             e_x < 0 → gate right of centre → yaw CW (negative)
+
+            if cx is not None:
+                # ── Gate visible: yaw proportionally toward it ──────────────
+                last_seen_t = time.time()
                 e_x = cx_mid - cx
                 print(f'  [SEARCH] gate spotted  cx={cx:.0f}  e_x={e_x:+.0f}px  size={size:.0f}px')
 
                 if abs(e_x) < ALIGN_PX:
                     print('  [SEARCH] gate centred → LOCK')
-                    return
+                    return True
 
-                # Proportional yaw toward gate, capped at SEARCH_YAW_RATE
                 yaw_rate = clamp(SEARCH_YAW_RATE * e_x / cx_mid,
-                                 -SEARCH_YAW_RATE, SEARCH_YAW_RATE)
+                                -SEARCH_YAW_RATE, SEARCH_YAW_RATE)
+                last_yaw_cmd = yaw_rate
                 self._hover(yaw_rate=yaw_rate, z=CRUISE_ALT)
+            else:
+                # ── Gate not visible this tick ──────────────────────────────
+                if time.time() - last_seen_t < MEMORY_WINDOW_S:
+                    # Recently saw the gate — keep yawing toward its last position
+                    self._hover(yaw_rate=last_yaw_cmd, z=CRUISE_ALT)
+                else:
+                    # Haven't seen the gate in a while — resume default CCW sweep
+                    last_yaw_cmd = SEARCH_YAW_RATE
+                    self._hover(yaw_rate=last_yaw_cmd, z=CRUISE_ALT)
 
             time.sleep(0.05)
+        return False
 
     # ── state: LOCK ──────────────────────────────────────────────────────────
 
