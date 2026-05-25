@@ -45,10 +45,6 @@ def preprocess_fill(gray, threshold=230,
     interior = cv2.bitwise_not(fill_src)
     full = cv2.bitwise_or(interior, closed)
 
-    if open_size >= 2:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_size, open_size))
-        full = cv2.morphologyEx(full, cv2.MORPH_OPEN, k)
-
     return {'raw': raw, 'closed': closed,
             'seal': seal, 'interior': interior, 'filled': full}
 
