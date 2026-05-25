@@ -178,6 +178,8 @@ NO_GATE_WAYPOINTS = []
 # ── Part 2: position-based mission ─────────────────────────────────────────────
 #
 # Gate positions are loaded from gates_info.csv beside this script.
+# The position mission uses exactly the rows present in the CSV; there is no
+# fixed 5-gate requirement.
 # CSV columns: Gate,x,y,z,theta,width,height
 # Each gate entry is (x, y, z, theta, width, height). theta is already radians.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -201,7 +203,9 @@ def load_gate_positions(csv_path=GATES_INFO_CSV):
                 raise ValueError(f'{csv_path} is missing column(s): {missing_cols}')
 
             for row_idx, row in enumerate(reader, start=2):
-                row = {k.strip(): v.strip() for k, v in row.items()}
+                row = {k.strip(): (v.strip() if v is not None else '') for k, v in row.items()}
+                if not any(row.values()):
+                    continue
                 gate_id = row.get('Gate', row_idx)
                 try:
                     gate_no = int(gate_id)
@@ -221,7 +225,9 @@ def load_gate_positions(csv_path=GATES_INFO_CSV):
         return []
 
     gates.sort(key=lambda item: item[0])
-    return [gate for _, gate in gates]
+    gate_positions = [gate for _, gate in gates]
+    print(f'Loaded {len(gate_positions)} gate(s) from {csv_path}')
+    return gate_positions
 
 
 GATE_POSITIONS = load_gate_positions()
@@ -1229,9 +1235,11 @@ class GateController:
         waypoints per gate to the Crazyflie's onboard position controller,
         advancing once the drone is within WAYPOINT_REACH_TOL of each.
         """
+        gates = list(gates)
         if not gates:
             print('GATE_POSITIONS is empty — fill it in before running Part 2.')
             return
+        print(f'Position mission will use {len(gates)} gate(s).')
 
         self._cf.param.set_value('kalman.resetEstimation', '1')
         time.sleep(0.1)
