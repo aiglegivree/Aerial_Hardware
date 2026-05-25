@@ -36,7 +36,7 @@ from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.utils import uri_helper
 
-from cv_detection import detect_gate
+from cv_detection2 import detect_gate
 
 warnings.filterwarnings("ignore", message=".*supervisor subsystem requires CRTP.*")
 logging.basicConfig(level=logging.ERROR)
@@ -64,7 +64,7 @@ FPV_RATE_HZ  = 10
 CPX_HEADER_SIZE  = 4
 IMG_HEADER_MAGIC = 0xBC
 IMG_HEADER_SIZE  = 11
-MIN_JPEG_BYTES   = 1000
+MIN_JPEG_BYTES   = 2000
 
 # ── arena bounds (Lighthouse world frame) ──────────────────────────────────────
 
