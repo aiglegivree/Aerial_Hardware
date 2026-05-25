@@ -105,7 +105,7 @@ CRUISE_ALT       = 1.25  # m ## TODO: The height position of the drone
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
-MAX_VZ_STEP = 0.005
+MAX_VZ_STEP = 0.005 ## DO NOT CHANGE (ALTITUDE COMMAND)
 
 # IBVS gains — tune these on the real drone
 KP_VX        = 0.012  # size error  (GATE_SIZE_CLOSE - size) → forward speed
@@ -126,14 +126,14 @@ ALIGN_DEADBAND = 0.08  # |asymmetry| below this is treated as head-on (no yaw)
 
 CENTER_TOL_PX = 40  # px — gate must be within this of frame centre before approaching
 
-# TRANSIT PHASE VELOCITY
+# TRANSIT PHASE VELOCITY (CURRENT POS TO GATE DISTANCE)
 TRANSIT_VX   = 0.10    # m/s
 TRANSIT_TIME = 10.0    # s
 
 SEARCH_YAW_RATE   = 10.0  # deg/s — yaw cap used by patrol waypointing
 SEARCH_SWEEP_RATE = 7.0   # deg/s — peak yaw rate during yaw sweep
 SEARCH_SWEEP_PERIOD = 10.0  # s   — full oscillation period (gives ±45° at 7 deg/s)
-LOST_TOLERANCE  = 30    # consecutive no-detection frames before re-search
+LOST_TOLERANCE  = 50    # consecutive no-detection frames before re-search
 
 N_GATES = 5  # Part 1 vision gates to search for
 GATE_HEIGHT = 0.4
@@ -716,7 +716,7 @@ class GateController:
         # BATTERY DEBUG
         vbat = data['pm.vbat']                               
         self._state['vbat'] = vbat                          
-        if vbat < 3.7 and time.time() - getattr(self, '_last_vbat_warn', 0) > 1.0:
+        if vbat < 3.2 and time.time() - getattr(self, '_last_vbat_warn', 0) > 1.0:
             print(f'  [LOW BATTERY] vbat={vbat:.2f} V')
             self._last_vbat_warn = time.time()
         # Uncomment to debug:
@@ -773,7 +773,7 @@ class GateController:
                 # Gate found: e_x > 0 → gate left of centre → yaw CCW (positive)
                 #             e_x < 0 → gate right of centre → yaw CW (negative)
                 e_x = cx_mid - cx
-                print(f'  [SEARCH] gate spotted  cx={cx:.0f}  e_x={e_x:+.0f}px  size={size:.0f}px')
+                # print(f'  [SEARCH] gate spotted  cx={cx:.0f}  e_x={e_x:+.0f}px  size={size:.0f}px')
 
                 if abs(e_x) < ALIGN_PX:
                     print('  [SEARCH] gate centred → APPROACH')
@@ -824,6 +824,10 @@ class GateController:
 
         EDGE_MARGIN = 8            # px — gate touching frame edge → don't trust asymmetry
 
+        last_v_forward = 0.0
+        last_v_strafe  = 0.0
+        last_yaw_rate  = 0.0
+
         while not self._stop:
             cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
 
@@ -835,7 +839,8 @@ class GateController:
             
                 # If altitude is already locked, hover at the locked height;
                 # otherwise hold the current target_z.
-                self._hover(z=locked_z if locked_z is not None else target_z)
+                self._hover(vx=last_v_forward, vy=last_v_strafe,
+                    yaw_rate=last_yaw_rate, z=z_cmd)
                 time.sleep(0.05)
                 continue
 
@@ -850,7 +855,7 @@ class GateController:
                 return True, locked_z
 
             # ── Step 2: pixel errors ────────────────────────────────────────
-            e_x = -cx + cx_mid          # +ve → gate left of centre
+            e_x = cx_mid - cx         # +ve → gate left of centre
             e_y = cy_mid - cy           # +ve → gate above centre
             e_z = GATE_SIZE_CLOSE - size  # +ve → gate too small
 
@@ -937,6 +942,9 @@ class GateController:
                 f'yaw={yaw_rate:+.1f}°/s z={z_cmd:.2f}[{z_tag}]')
 
             # ── Step 8: send command ────────────────────────────────────────
+            last_v_forward = v_forward
+            last_v_strafe  = v_strafe
+            last_yaw_rate  = yaw_rate
             self._hover(vx=v_forward, vy=v_strafe, yaw_rate=yaw_rate, z=z_cmd)
             time.sleep(0.05)
 
@@ -1019,7 +1027,7 @@ class GateController:
 
         finally:
             save_running[0] = False
-            print(f'[FRAME SAVER] stopped — {frame_idx[0]} frames saved to gate_frames/')
+            # print(f'[FRAME SAVER] stopped — {frame_idx[0]} frames saved to gate_frames/')
             # Always attempt a controlled landing, whatever happened above.
             # _stop_motors() is NOT called here — land() does a gradual descent
             # and only cuts motors at the end, so the drone doesn't just drop.
