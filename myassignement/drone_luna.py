@@ -839,8 +839,9 @@ class GateController:
             
                 # If altitude is already locked, hover at the locked height;
                 # otherwise hold the current target_z.
+                z_hold = locked_z if locked_z is not None else target_z
                 self._hover(vx=last_v_forward, vy=last_v_strafe,
-                    yaw_rate=last_yaw_rate, z=z_cmd)
+                    yaw_rate=last_yaw_rate, z=z_hold)
                 time.sleep(0.05)
                 continue
 
