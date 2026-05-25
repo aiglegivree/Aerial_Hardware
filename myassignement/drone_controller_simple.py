@@ -45,6 +45,7 @@ Press 'q' at any time for emergency stop.
 """
 
 import contextlib
+import csv
 import logging
 import math
 import multiprocessing as mp
@@ -176,11 +177,54 @@ NO_GATE_WAYPOINTS = []
 
 # ── Part 2: position-based mission ─────────────────────────────────────────────
 #
-# Fill GATE_POSITIONS once the instructor gives you the exact gate positions.
-# Each gate entry will be (x, y, z, theta, height, width)
-GATE_POSITIONS = [    (0.5, -0.7, 1.2, np.deg2rad(58), 0.5, GATE_HEIGHT), (1.7, -0.75, 1.35, np.deg2rad(115), 0.29, GATE_HEIGHT),
-    (2.5, 0.08, 1.43, np.deg2rad(158), 0.4, GATE_HEIGHT), (1.6, 0.9, 1.3, np.deg2rad(244), 0.4, GATE_HEIGHT),
-    (0.55, 0.95, 1.3, np.deg2rad(286), 0.29, GATE_HEIGHT)]
+# Gate positions are loaded from gates_info.csv beside this script.
+# CSV columns: Gate,x,y,z,theta,width,height
+# Each gate entry is (x, y, z, theta, width, height). theta is already radians.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+GATES_INFO_CSV = os.path.join(SCRIPT_DIR, 'gates_info.csv')
+
+
+def load_gate_positions(csv_path=GATES_INFO_CSV):
+    required = {'x', 'y', 'z', 'theta', 'width', 'height'}
+    gates = []
+
+    try:
+        with open(csv_path, newline='') as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError(f'{csv_path} is empty')
+
+            fieldnames = {name.strip() for name in reader.fieldnames}
+            missing = required - fieldnames
+            if missing:
+                missing_cols = ', '.join(sorted(missing))
+                raise ValueError(f'{csv_path} is missing column(s): {missing_cols}')
+
+            for row_idx, row in enumerate(reader, start=2):
+                row = {k.strip(): v.strip() for k, v in row.items()}
+                gate_id = row.get('Gate', row_idx)
+                try:
+                    gate_no = int(gate_id)
+                    gate = (
+                        float(row['x']),
+                        float(row['y']),
+                        float(row['z']),
+                        float(row['theta']),
+                        float(row['width']),
+                        float(row['height']),
+                    )
+                except ValueError as e:
+                    raise ValueError(f'Invalid numeric value in {csv_path}, row {row_idx}') from e
+                gates.append((gate_no, gate))
+    except FileNotFoundError:
+        print(f'Gate CSV not found: {csv_path}')
+        return []
+
+    gates.sort(key=lambda item: item[0])
+    return [gate for _, gate in gates]
+
+
+GATE_POSITIONS = load_gate_positions()
 
 N_LAPS           = 2     # number of timed laps
 PRE_GATE_OFFSET  = 0.3   # m — waypoint placed before the gate along its approach axis
