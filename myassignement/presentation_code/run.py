@@ -12,8 +12,8 @@ MODE = "vision"   # "vision" or "position"
 
 if __name__ == '__main__':
     if MODE == "vision":
-        import vision_lap
-        vision_lap.main()
+        import vision_triangulation_lap
+        vision_triangulation_lap.main()
     elif MODE == "position":
         import position_lap
         position_lap.main()
