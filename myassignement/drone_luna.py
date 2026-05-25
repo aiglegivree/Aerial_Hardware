@@ -127,7 +127,7 @@ ALIGN_DEADBAND = 0.08  # |asymmetry| below this is treated as head-on (no yaw)
 CENTER_TOL_PX = 20  # px — gate must be within this of frame centre before approaching
 
 TRANSIT_VX   = 0.10    # m/s
-TRANSIT_TIME = 4.0    # s
+TRANSIT_TIME = 5.0    # s
 
 SEARCH_YAW_RATE   = 10.0  # deg/s — yaw cap used by patrol waypointing
 SEARCH_SWEEP_RATE = 7.0   # deg/s — peak yaw rate during yaw sweep
@@ -1182,7 +1182,7 @@ class GateController:
             py = gy - PRE_GATE_OFFSET * diry + by
             qx = gx + POST_GATE_OFFSET * dirx + bx
             qy = gy + POST_GATE_OFFSET * diry + by
-            
+
             waypoints.append((px, py, gz))
             waypoints.append((cx, cy, gz))
             waypoints.append((qx, qy, gz))
