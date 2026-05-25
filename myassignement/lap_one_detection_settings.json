@@ -1,0 +1,15 @@
+{
+  "threshold": 155,
+  "min_area": 120,
+  "median_ksize": 3,
+  "close_short": 7,
+  "close_long": 3,
+  "dilate_extra": 1,
+  "border_pad": 0,
+  "close_coverage": 1.0,
+  "include_border": true,
+  "all_green": true,
+  "folder": "20260524_140130",
+  "frame": 9,
+  "view": "closed_filled"
+}
