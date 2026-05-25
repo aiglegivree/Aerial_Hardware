@@ -101,7 +101,7 @@ MIN_JPEG_BYTES   = 1000
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
-CRUISE_ALT       = 1.25  # m ## The height position of the drone
+CRUISE_ALT       = 1.25  # m ## TODO: The height position of the drone
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
@@ -117,7 +117,7 @@ MAX_VZ_DELTA = 0.5    # m   — altitude adjustment cap
 
 ALIGN_TOL_ARM    = 0.10  # arm forward motion when |asymmetry| below this
 ALIGN_TOL_DISARM = 0.20  # disarm forward motion when |asymmetry| above this (hysteresis)
-PARK_HOLD_S      = 0.3   # all conditions must hold this long before forward motion
+PARK_HOLD_S      = 0.2   # all conditions must hold this long before forward motion
 
 # Yaw alignment from gate edge asymmetry
 KP_YAW_ALIGN   = 8.0   # deg/s per unit-asymmetry; max yaw = KP × 1.0
@@ -126,34 +126,16 @@ ALIGN_DEADBAND = 0.08  # |asymmetry| below this is treated as head-on (no yaw)
 
 CENTER_TOL_PX = 40  # px — gate must be within this of frame centre before approaching
 
+# TRANSIT PHASE VELOCITY
 TRANSIT_VX   = 0.10    # m/s
 TRANSIT_TIME = 10.0    # s
 
 SEARCH_YAW_RATE   = 10.0  # deg/s — yaw cap used by patrol waypointing
 SEARCH_SWEEP_RATE = 7.0   # deg/s — peak yaw rate during yaw sweep
 SEARCH_SWEEP_PERIOD = 10.0  # s   — full oscillation period (gives ±45° at 7 deg/s)
-LOST_TOLERANCE  = 15    # consecutive no-detection frames before re-search
-
-# After SEARCH spots a gate, hold position for this long while continuing to
-# detect, then commit to APPROACH.
-LOCK_DURATION   = 1.5   # s — hover-and-confirm window
+LOST_TOLERANCE  = 30    # consecutive no-detection frames before re-search
 
 N_GATES = 5  # Part 1 vision gates to search for
-
-# ── Part 1: patrol search path ─────────────────────────────────────────────────
-#
-# In the vision lap the drone flies this circular patrol while watching the
-# camera. The yaw-sweep search_for_gate() is only a FALLBACK, used when a
-# patrol leg ends with no gate in view.
-PATROL_RADIUS      = 1.2   # m — radius of the circular search path (Lighthouse frame)
-WAYPOINT_TOL       = 0.20  # m — patrol-waypoint reached tolerance
-WAYPOINT_KP        = 0.8   # position error (m) → velocity (m/s)
-WAYPOINT_SPEED_MIN = 0.05  # m/s
-WAYPOINT_SPEED_MAX = 0.30  # m/s
-WAYPOINT_YAW_KP    = 1.5   # heading error (deg) → yaw rate (deg/s)
-
-# One patrol waypoint per gate, evenly spaced counter-clockwise around the
-# circle. Replace with explicit (x, y) coordinates once you know your arena.
 GATE_HEIGHT = 0.4
 
 # ── Part 2: position-based mission ─────────────────────────────────────────────
@@ -775,10 +757,8 @@ class GateController:
 
     def search_for_gate(self):
         """
-        Matt-style search: continuous CCW rotation at SEARCH_YAW_RATE deg/s.
-        Once a gate is spotted, stop spinning and proportionally yaw to centre
-        it in the frame before returning — so lock_on_gate starts with the gate
-        already roughly centred, not at some random edge position.
+        Continuous CCW rotation at SEARCH_YAW_RATE deg/s until a gate is spotted,
+        then proportionally yaws to centre it before returning to APPROACH.
         """
         print('  [SEARCH] rotating CCW...')
         cx_mid   = CAM_WIDTH / 2.0
@@ -796,7 +776,7 @@ class GateController:
                 print(f'  [SEARCH] gate spotted  cx={cx:.0f}  e_x={e_x:+.0f}px  size={size:.0f}px')
 
                 if abs(e_x) < ALIGN_PX:
-                    print('  [SEARCH] gate centred → LOCK')
+                    print('  [SEARCH] gate centred → APPROACH')
                     return
 
                 # Proportional yaw toward gate, capped at SEARCH_YAW_RATE
@@ -806,58 +786,36 @@ class GateController:
 
             time.sleep(0.05)
 
-    # ── state: LOCK ──────────────────────────────────────────────────────────
-
-    def lock_on_gate(self):
-        """
-        After SEARCH first spots a gate, stop yawing and hover in place for
-        LOCK_DURATION seconds. Requires the gate to be detected in at least
-        50% of ticks — a single false-positive from SEARCH is not enough to
-        pass. Returns True if confirmed, False → back to SEARCH.
-        """
-        print(f'  [LOCK] holding {LOCK_DURATION:.1f}s to confirm detection')
-        t_end = time.time() + LOCK_DURATION
-        n_ticks = 0
-        n_detected = 0
-        last = None
-        while time.time() < t_end and not self._stop:
-            cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
-            n_ticks += 1
-            if cx is not None:
-                n_detected += 1
-                last = (cx, cy, size)
-            self._hover(z=CRUISE_ALT)
-            time.sleep(0.05)
-
-        rate = n_detected / n_ticks if n_ticks > 0 else 0.0
-        if last is not None and rate >= 0.5:
-            print(f'  [LOCK] confirmed ({n_detected}/{n_ticks} detections,'
-                  f' cx={last[0]:.0f} size={last[2]:.0f}px) → APPROACH')
-            return True
-        print(f'  [LOCK] rejected ({n_detected}/{n_ticks} detections, {rate:.0%}) → SEARCH')
-        return False
-
     # ── state: APPROACH ──────────────────────────────────────────────────────
 
     def approach_gate(self):
         """
         Image-Based Visual Servoing (IBVS) with park-before-approach.
-
+ 
         The drone first strafes, climbs/descends, and yaws to position itself
         head-on in front of the gate. Only once ALL three conditions hold
         continuously for PARK_HOLD_S does it start advancing forward.
-
+ 
         |e_x| < CENTER_TOL_PX   — gate horizontally centred
         |e_y| < CENTER_TOL_PX   — gate vertically centred
         |asymmetry| < ALIGN_TOL — gate viewed head-on (edges equal)
-
-        Returns True  when size ≥ GATE_SIZE_CLOSE  (→ TRANSIT).
-        Returns False when gate lost > LOST_TOLERANCE (→ SEARCH).
+ 
+        Altitude policy: while the gate is not yet centred (|e_y| ≥ CENTER_TOL_PX)
+        the drone climbs/descends to centre it. The first time the gate is
+        centred (both axes within CENTER_TOL_PX), the current altitude is
+        snapshotted into `locked_z` and held for the rest of APPROACH — no
+        further pixel-driven altitude corrections. TRANSIT then flies through
+        at that same locked altitude, so the next SEARCH is the only point at
+        which altitude resets to CRUISE_ALT.
+ 
+        Returns (True, locked_z)  when size ≥ GATE_SIZE_CLOSE  (→ TRANSIT).
+        Returns (False, None)     when gate lost > LOST_TOLERANCE (→ SEARCH).
         """
         print('  [APPROACH] IBVS toward gate (park-first)')
         cx_mid   = CAM_WIDTH  / 2.0
         cy_mid   = CAM_HEIGHT / 2.0
         target_z = CRUISE_ALT
+        locked_z = None  
         lost     = 0
 
         # Per-attempt parking state (reset on every approach_gate call)
@@ -873,8 +831,11 @@ class GateController:
                 lost += 1
                 if lost > LOST_TOLERANCE:
                     print('  [APPROACH] gate lost — back to SEARCH')
-                    return False
-                self._hover(z=target_z)
+                    return False, None
+            
+                # If altitude is already locked, hover at the locked height;
+                # otherwise hold the current target_z.
+                self._hover(z=locked_z if locked_z is not None else target_z)
                 time.sleep(0.05)
                 continue
 
@@ -883,7 +844,10 @@ class GateController:
             # ── Step 1: termination ─────────────────────────────────────────
             if size >= GATE_SIZE_CLOSE:
                 print(f'  [APPROACH] gate fills frame (size={size:.0f}px) → TRANSIT')
-                return True
+                if locked_z is None:
+                    locked_z = self._state['z']
+                    print(f'  [APPROACH] altitude not yet locked — using current z={locked_z:.2f}')
+                return True, locked_z
 
             # ── Step 2: pixel errors ────────────────────────────────────────
             e_x = -cx + cx_mid          # +ve → gate left of centre
@@ -939,87 +903,63 @@ class GateController:
 
             v_forward = clamp(KP_VX * e_z, 0.0, MAX_VX) if park_armed else 0.0
 
-            # ── Step 6: rate-limited altitude ───────────────────────────────
-            desired_dz = clamp(KP_VZ * e_y, -MAX_VZ_DELTA, MAX_VZ_DELTA)
-            target_z_desired = clamp(CRUISE_ALT + desired_dz,
-                                    CRUISE_ALT - MAX_VZ_DELTA,
-                                    CRUISE_ALT + MAX_VZ_DELTA)
-            dz_step = clamp(target_z_desired - target_z, -MAX_VZ_STEP, MAX_VZ_STEP)
-            target_z += dz_step
+            # ── Step 6: altitude — correct until centred, then LOCK ─────────
+            # While the gate is not yet centred in BOTH axes, run the standard
+            # rate-limited altitude correction. The first time both centering
+            # conditions hold, snapshot the current measured altitude and stop
+            # adjusting — that altitude is held for the rest of APPROACH and
+            # passed to TRANSIT so the drone keeps it through the gate.
+            if locked_z is None:
+                if centered:
+                    locked_z = self._state['z']
+                    print(f'  [APPROACH] gate centred → locking altitude z={locked_z:.2f} m '
+                          f'(no further altitude corrections until next SEARCH)')
+                else:
+                    desired_dz = clamp(KP_VZ * e_y, -MAX_VZ_DELTA, MAX_VZ_DELTA)
+                    target_z_desired = clamp(CRUISE_ALT + desired_dz,
+                                            CRUISE_ALT - MAX_VZ_DELTA,
+                                            CRUISE_ALT + MAX_VZ_DELTA)
+                    dz_step = clamp(target_z_desired - target_z, -MAX_VZ_STEP, MAX_VZ_STEP)
+                    target_z += dz_step
+ 
+            # Altitude actually commanded this tick: locked value if available,
+            # else the still-converging target_z.
+            z_cmd = locked_z if locked_z is not None else target_z
+ 
 
             # ── Step 7: telemetry ───────────────────────────────────────────
             status = 'GO' if park_armed else 'park'
             align_str = f'{asymmetry:+.2f}' if have_align else '  -- '
+            z_tag = 'LOCK' if locked_z is not None else ' adj'
             print(f'  [IBVS|{status}] ex={e_x:+.0f} ey={e_y:+.0f} '
                 f'asym={align_str} size={size:.0f}px → '
                 f'vx={v_forward:.2f} vy={v_strafe:+.2f} '
-                f'yaw={yaw_rate:+.1f}°/s z={target_z:.2f}')
+                f'yaw={yaw_rate:+.1f}°/s z={z_cmd:.2f}[{z_tag}]')
 
             # ── Step 8: send command ────────────────────────────────────────
-            self._hover(vx=v_forward, vy=v_strafe, yaw_rate=yaw_rate, z=target_z)
+            self._hover(vx=v_forward, vy=v_strafe, yaw_rate=yaw_rate, z=z_cmd)
             time.sleep(0.05)
 
-        return False
+        return False, None
 
     # ── state: TRANSIT ───────────────────────────────────────────────────────
 
-    def transit_gate(self):
-        """Push straight forward for TRANSIT_TIME to clear the gate."""
-        print('  [TRANSIT] flying through gate')
+    def transit_gate(self, z=None):
+        """Push straight forward for TRANSIT_TIME to clear the gate.
+ 
+        Flies at the altitude `z` locked in by approach_gate (the altitude
+        at which the gate was centred). Falls back to CRUISE_ALT if no
+        locked altitude was provided.
+        """
+        z_cmd = z if z is not None else CRUISE_ALT
+        print(f'  [TRANSIT] flying through gate at z={z_cmd:.2f} m')
         t_end = time.time() + TRANSIT_TIME
         while time.time() < t_end and not self._stop:
-            self._hover(vx=TRANSIT_VX, z=CRUISE_ALT)
+            self._hover(vx=TRANSIT_VX, z=z_cmd)
             time.sleep(0.05)
         print('  [TRANSIT] done')
 
     # ── mission: Part 1 — vision ─────────────────────────────────────────────
-
-    def fly_to_waypoint(self, wx, wy, wz=CRUISE_ALT, scan=True):
-        """
-        Fly toward the patrol waypoint (wx, wy) in the Lighthouse world frame
-        using boundary-safe hover setpoints, yawing to face the direction of
-        travel so the camera looks ahead. While `scan` is True the camera is
-        checked every cycle.
-
-        Returns:
-          'found'   — a gate was detected (→ approach it)
-          'reached' — waypoint reached without seeing a gate (→ fallback search)
-          'stopped' — emergency stop requested
-        """
-        print(f'  [PATROL] flying to waypoint ({wx:.2f}, {wy:.2f})')
-        while not self._stop:
-            if scan:
-                cx, cy, size, left_h, right_h, _ = get_gate_detection(self._cam.latest_frame)
-                if cx is not None:
-                    print(f'  [PATROL] gate spotted  cx={cx:.0f}  size={size:.0f}px')
-                    return 'found'
-
-            ex = wx - self._state['x']
-            ey = wy - self._state['y']
-            dist = math.hypot(ex, ey)
-            if dist < WAYPOINT_TOL:
-                return 'reached'
-
-            # World-frame velocity toward the waypoint, speed proportional to distance
-            speed = clamp(WAYPOINT_KP * dist, WAYPOINT_SPEED_MIN, WAYPOINT_SPEED_MAX)
-            wvx = speed * ex / dist
-            wvy = speed * ey / dist
-
-            # Rotate world → body: _safe_hover expects body-frame vx, vy
-            yaw = math.radians(self._state['yaw'])
-            bvx =  wvx * math.cos(yaw) + wvy * math.sin(yaw)
-            bvy = -wvx * math.sin(yaw) + wvy * math.cos(yaw)
-
-            # Yaw toward the direction of travel so the camera scans ahead
-            desired_yaw = math.degrees(math.atan2(ey, ex))
-            yaw_err = (desired_yaw - self._state['yaw'] + 180) % 360 - 180
-            yaw_rate = clamp(WAYPOINT_YAW_KP * yaw_err,
-                             -SEARCH_YAW_RATE, SEARCH_YAW_RATE)
-
-            self._hover(vx=bvx, vy=bvy, yaw_rate=yaw_rate, z=wz)
-            time.sleep(0.05)
-
-        return 'stopped'
 
     def run_vision_lap(self):
         self._cf.param.set_value('kalman.resetEstimation', '1')
@@ -1057,61 +997,23 @@ class GateController:
 
                 print(f'\n=== Gate {gate_idx + 1} / {N_GATES} ===')
 
-                # 1. Sweep yaw until the gate appears in frame, then hover to
-                #    confirm the detection is stable before committing.
-                while not self._stop:
-                    self.search_for_gate()
-                    if self._stop or self.lock_on_gate():
-                        break
-
+                # 1. Sweep yaw until the gate is centred in frame
+                self.search_for_gate()
                 if self._stop:
                     break
 
                 # 2. Servo toward gate; if lost mid-approach, search again
                 while not self._stop:
-                    if self.approach_gate():
-                        self.transit_gate()
+                    success, locked_z = self.approach_gate()
+                    if success:
+                        self.transit_gate(z=locked_z)
                         break
                     print('  gate lost — searching again')
-                    while not self._stop:
-                        self.search_for_gate()
-                        if self._stop or self.lock_on_gate():
-                            break
+                    self.search_for_gate()
 
             msg = 'All gates complete' if not self._stop else 'Emergency stop'
             print(f'\n{msg} — landing')
-            # ──────────────────────────────────────────────────────────────────
-
-            # ── TEST CODE (commented out) ──────────────────────────────────────
-            # print('\n[TEST] Hovering at 1.0 m — calling get_gate_detection every tick')
-            # os.makedirs('gate_frames', exist_ok=True)
-            # frame_idx = 0
-            # target_z  = 1.0
-            # cx_mid    = CAM_WIDTH  / 2.0
-            # cy_mid    = CAM_HEIGHT / 2.0
-            # while not self._stop:
-            #     frame = self._cam.latest_frame
-            #     cx, cy, size = get_gate_detection(frame)
-            #     if cx is not None:
-            #         lat_err  = cx - cx_mid
-            #         vy       = clamp(KP_VY * lat_err, -MAX_VY, MAX_VY)
-            #         vert_err = cy_mid - cy
-            #         target_z = clamp(1.0 + KP_VZ * vert_err,
-            #                          1.0 - MAX_VZ_DELTA, 1.0 + MAX_VZ_DELTA)
-            #         print(f'  [GATE DETECTED] cx={cx:.0f} cy={cy:.0f} size={size:.0f}px'
-            #               f'  → vy={vy:+.3f} m/s  z={target_z:.2f} m')
-            #         if frame is not None:
-            #             path = os.path.join('gate_frames', f'gate_{frame_idx:04d}.png')
-            #             cv2.imwrite(path, frame)
-            #             print(f'  [SAVED] {path}')
-            #             frame_idx += 1
-            #         self._safe_hover(vy=vy, z=target_z)
-            #     else:
-            #         print('  [NO GATE] — holding position')
-            #         self._safe_hover(z=target_z)
-            #     time.sleep(0.1)
-            # ──────────────────────────────────────────────────────────────────
-
+            
         except Exception as e:
             print(f'\nUnhandled exception during mission: {e} — landing now')
 
@@ -1184,7 +1086,7 @@ class GateController:
             qy = gy + POST_GATE_OFFSET * diry + by
 
             waypoints.append((px, py, gz))
-            waypoints.append((cx, cy, gz))
+            waypoints.append((gx, gy, gz))
             waypoints.append((qx, qy, gz))
 
             prev_xy = (qx, qy)   # next gate's flythrough sign is chosen relative
