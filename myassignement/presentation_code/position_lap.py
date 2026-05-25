@@ -1,20 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Gate traversal controller — Crazyflie + Lighthouse (POSITION mode only)
-========================================================================
+Part 2: position-mode lap with known gate poses.
 
-Part 2 — raw waypoint streaming (Lighthouse world frame):
-  Build one waypoint list per lap (start → pre-gate, gate centre, post-gate
-  ×N → return). Stream each waypoint via send_position_setpoint and advance
-  to the next once the drone is within WAYPOINT_REACH_TOL. The Crazyflie's
-  onboard position controller smooths the motion between waypoints; no
-  polynomial trajectory fit needed.
+Gate (x, y, z, theta) come from gates_info.csv in the Lighthouse world frame.
+For each gate we build a (pre, centre, post) waypoint triple along the gate's
+normal, concatenate all the triples into one polyline, and follow that path
+with pure pursuit (a moving carrot point streamed as the position setpoint).
 
-Boundary safety:
-  stateEstimate.x/y from Lighthouse → enforce arena hard limits.
+Lighthouse pose is also used to keep the drone inside the arena bounds.
 
-Press 'q' at any time for emergency stop (cuts motors).
-Press ESC for a controlled landing.
+Keys: 'q' = motor cut, ESC = controlled landing.
 """
 
 import csv
@@ -41,24 +36,20 @@ logging.basicConfig(level=logging.ERROR)
 CONTROL_URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E708')
 
 # ── arena bounds (Lighthouse world frame) ──────────────────────────────────────
-ARENA_X_MIN = -1.0   # m — back wall
-ARENA_X_MAX = +3.0   # m — front wall
-ARENA_Y_MIN = -0.9   # m — right wall
-ARENA_Y_MAX = +0.9   # m — left wall
+ARENA_X_MIN = -1.0   # m, back wall
+ARENA_X_MAX = +3.0   # m, front wall
+ARENA_Y_MIN = -0.9   # m, right wall
+ARENA_Y_MAX = +0.9   # m, left wall
 
-SAFETY_MARGIN_HARD = 0.00000  # m — never fly closer than this to a wall
+SAFETY_MARGIN_HARD = 0.00000  # m, hard wall margin
 
 # ── flight ─────────────────────────────────────────────────────────────────────
 
-CRUISE_ALT       = 1.25  # m ## The height position of the drone
+CRUISE_ALT       = 1.25  # m, cruise altitude
 TAKEOFF_DURATION = 3.0   # s
 LAND_DURATION    = 3.0   # s
 
-# ── Part 2: position-based mission ─────────────────────────────────────────────
-#
-# Gate positions are loaded from gates_info.csv beside this script.
-# CSV columns: Gate,x,y,z,theta,width,height
-# Each gate entry is (x, y, z, theta, width, height). theta is already radians.
+# Gate poses from gates_info.csv: columns Gate,x,y,z,theta,width,height (theta in radians).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 GATES_INFO_CSV = os.path.join(SCRIPT_DIR, 'gates_info.csv')
 
@@ -110,13 +101,16 @@ def load_gate_positions(csv_path=GATES_INFO_CSV):
 GATE_POSITIONS = load_gate_positions()
 
 N_LAPS           = 2     # number of timed laps
-PRE_GATE_OFFSET  = 0.3   # m — waypoint placed before the gate along its approach axis
-POST_GATE_OFFSET = 0.3   # m — waypoint placed after the gate (clears the frame)
 
-POSITION_RATE_HZ   = 20.0  # setpoint streaming rate
-WAYPOINT_REACH_TOL = 0.15  # m — final-waypoint reached tolerance
-PURSUIT_LOOKAHEAD  = 0.35  # m — carrot distance ahead of drone along the path
-                            #     larger = smoother + faster, smaller = tighter tracking
+# Per-gate waypoint triple: pre and post are placed along the gate's normal so
+# the drone enters straight-on and exits cleanly before turning to the next.
+PRE_GATE_OFFSET  = 0.3   # m, before the gate
+POST_GATE_OFFSET = 0.3   # m, after the gate
+
+POSITION_RATE_HZ   = 20.0  # Hz, setpoint streaming rate
+WAYPOINT_REACH_TOL = 0.15  # m, tolerance to consider the final waypoint reached
+PURSUIT_LOOKAHEAD  = 0.35  # m, carrot distance ahead of drone along the path
+                           # larger = smoother + faster, smaller = tighter tracking
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -158,18 +152,15 @@ class GateController:
     # ── boundary-safe hover ──────────────────────────────────────────────────
 
     def _safe_hover(self, vx=0.0, vy=0.0, yaw_rate=0.0, z=CRUISE_ALT):
-        """
-        Send hover setpoint, blocking outward velocity at the arena boundary.
-        """
+        """Hover setpoint, with outward velocity zeroed at the arena bounds."""
         x   = self._state['x']
         y   = self._state['y']
         yaw = math.radians(self._state['yaw'])
 
-        # Body → world
+        # body -> world, so we can compare against world-frame arena bounds
         wx = vx * math.cos(yaw) - vy * math.sin(yaw)
         wy = vx * math.sin(yaw) + vy * math.cos(yaw)
 
-        # Hard cutoff per axis
         if x <= ARENA_X_MIN + SAFETY_MARGIN_HARD and wx < 0:
             wx = 0.0
         if x >= ARENA_X_MAX - SAFETY_MARGIN_HARD and wx > 0:
@@ -179,7 +170,7 @@ class GateController:
         if y >= ARENA_Y_MAX - SAFETY_MARGIN_HARD and wy > 0:
             wy = 0.0
 
-        # World → body
+        # world -> body, the Crazyflie's hover setpoint takes body-frame vx/vy
         vx_s =  wx * math.cos(yaw) + wy * math.sin(yaw)
         vy_s = -wx * math.sin(yaw) + wy * math.cos(yaw)
 
@@ -209,12 +200,10 @@ class GateController:
             time.sleep(0.1)
         self._stop_motors()
 
-    # =========================================================================
-    # PART 2 — position-based mission (known gate coordinates)
-    # =========================================================================
+    # ── position-mission helpers ─────────────────────────────────────────────
 
     def _clamp_to_boundary(self, x, y):
-        """Clamp a target (x, y) to the rectangular arena minus the hard safety margin."""
+        """Clamp a target (x, y) to the arena minus the hard safety margin."""
         x_lo = ARENA_X_MIN + SAFETY_MARGIN_HARD
         x_hi = ARENA_X_MAX - SAFETY_MARGIN_HARD
         y_lo = ARENA_Y_MIN + SAFETY_MARGIN_HARD
@@ -226,21 +215,20 @@ class GateController:
         return xc, yc
 
     def _plan_lap(self, gates, start_xyz):
-        """
-        Build the one-lap waypoint list: start → (pre, centre, post) per gate
-        → return to start. Yaw is set to face the flythrough direction at each
-        gate. Returns a list of (x, y, z, yaw_rad) tuples.
-        """
+        """Build the per-lap waypoint list: start, then (pre, centre, post) for
+        each gate, then back to start. Returns (x, y, z, yaw_rad) tuples."""
         waypoints = [(start_xyz[0], start_xyz[1], start_xyz[2], 0.0)]
         prev_xy = (start_xyz[0], start_xyz[1])
 
         for g in gates:
             gx, gy, gz, theta, _gw, _gh = g
 
-            # Flythrough direction; flip if it points back toward where we came from.
+            # theta is the gate's facing angle. A gate has no front/back, so flip
+            # the normal if it would send us back toward where we came from.
             dirx, diry = -math.sin(theta), math.cos(theta)
             if (gx - prev_xy[0]) * dirx + (gy - prev_xy[1]) * diry < 0:
                 dirx, diry = -dirx, -diry
+            # yaw points the drone (and camera) into the flythrough direction
             yaw = math.atan2(diry, dirx)
 
             px, py = self._clamp_to_boundary(gx - PRE_GATE_OFFSET * dirx,
@@ -258,16 +246,15 @@ class GateController:
         return waypoints
 
     def _follow_path_pure_pursuit(self, waypoints, dt):
-        """
-        Stream a moving carrot point along the polyline `waypoints`
-        (list of (x, y, z, yaw_rad)).
-        """
+        """Pure pursuit along the polyline. Project the drone onto the current
+        segment, place a carrot PURSUIT_LOOKAHEAD metres further along the
+        path, and stream that as the position setpoint each tick."""
         if len(waypoints) < 2:
             return
 
         pts = [np.array([w[0], w[1], w[2]]) for w in waypoints]
         yaws = [w[3] for w in waypoints]
-        seg_idx = 0  # current segment is pts[seg_idx] → pts[seg_idx+1]
+        seg_idx = 0  # current segment is pts[seg_idx] -> pts[seg_idx+1]
 
         while not self._stop:
             drone = np.array([self._state['x'], self._state['y'], self._state['z']])
@@ -293,8 +280,8 @@ class GateController:
                 if np.linalg.norm(drone - pts[-1]) < WAYPOINT_REACH_TOL:
                     break
 
-            # Carrot: start from projection on current segment, then walk
-            # forward along the polyline by PURSUIT_LOOKAHEAD metres.
+            # Carrot: start from the projection on the current segment, then
+            # walk forward along the polyline by PURSUIT_LOOKAHEAD metres.
             a, b = pts[seg_idx], pts[seg_idx + 1]
             ab = b - a
             ab_len = float(np.linalg.norm(ab))
@@ -333,17 +320,14 @@ class GateController:
             time.sleep(dt)
 
     def run_fast_lap(self, gates, n_laps=N_LAPS):
-        """
-        Part 2: gate positions are known. Stream raw (pre, centre, post)
-        waypoints per gate to the Crazyflie's onboard position controller,
-        advancing once the drone is within WAYPOINT_REACH_TOL of each.
-        """
+        """Plan and fly n_laps of the gate course using pure pursuit."""
         gates = list(gates)
         if not gates:
-            print('GATE_POSITIONS is empty — fill it in before running Part 2.')
+            print('GATE_POSITIONS is empty.')
             return
         print(f'Position mission will use {len(gates)} gate(s).')
 
+        # Reset the onboard EKF so the world frame is aligned to the current pose.
         self._cf.param.set_value('kalman.resetEstimation', '1')
         time.sleep(0.1)
         self._cf.param.set_value('kalman.resetEstimation', '0')
@@ -388,7 +372,7 @@ class GateController:
 # ── emergency stop ─────────────────────────────────────────────────────────────
 
 def emergency_stop_listener(ctrl: GateController, cf: Crazyflie):
-    """ESC → controlled landing. Q → immediate motor kill."""
+    """'q' cuts motors immediately. ESC lands first."""
 
     def on_press(key):
         if key == keyboard.Key.esc:
