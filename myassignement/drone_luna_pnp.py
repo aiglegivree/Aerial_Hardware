@@ -963,14 +963,133 @@ class GateController:
 
     # ── state: TRANSIT ───────────────────────────────────────────────────────
 
+    def _compute_past_gate_waypoint(self, quad, K, DIST, fy, gate_h_m, past_m):
+        """
+        From an ordered (TL, TR, BR, BL) quad of the detected gate, return
+        a world-frame waypoint placed `past_m` metres past the gate centre
+        along its outward normal, plus the drone yaw at the moment of
+        computation. Returns (None, None) on degenerate input.
+
+        Gates are 40 cm tall, so each vertical edge's pixel length gives
+        its camera-frame Z (depth). Back-project both edge midpoints to
+        3D, take their midpoint as the gate centre, and build the outward
+        normal perpendicular to (P_right - P_left) in the camera X-Z
+        plane (assumes the gate is upright).
+        """
+        tl, tr, br, bl = quad
+        L_px = float(np.linalg.norm(bl - tl))
+        R_px = float(np.linalg.norm(br - tr))
+        if L_px < 5 or R_px < 5:
+            return None, None
+
+        Z_L = fy * gate_h_m / L_px
+        Z_R = fy * gate_h_m / R_px
+
+        mids = np.array([(tl + bl) / 2.0, (tr + br) / 2.0],
+                        dtype=np.float32).reshape(-1, 1, 2)
+        norm_pts = cv2.undistortPoints(mids, K, DIST).reshape(-1, 2)
+        P_L = np.array([norm_pts[0, 0] * Z_L, norm_pts[0, 1] * Z_L, Z_L])
+        P_R = np.array([norm_pts[1, 0] * Z_R, norm_pts[1, 1] * Z_R, Z_R])
+
+        centre_cam = (P_L + P_R) / 2.0
+        horiz = P_R - P_L
+        n = np.array([-horiz[2], 0.0, horiz[0]])  # perpendicular in cam X-Z plane
+        nn = float(np.linalg.norm(n))
+        if nn < 1e-6:
+            return None, None
+        n /= nn
+        if n[2] < 0:
+            n = -n
+        target_cam = centre_cam + past_m * n
+
+        # Camera (+X right, +Y down, +Z forward) → body (+X fwd, +Y left, +Z up)
+        body_dx =  target_cam[2]
+        body_dy = -target_cam[0]
+        body_dz = -target_cam[1]
+
+        psi = math.radians(self._state['yaw'])
+        world_dx = body_dx * math.cos(psi) - body_dy * math.sin(psi)
+        world_dy = body_dx * math.sin(psi) + body_dy * math.cos(psi)
+
+        target_world = (self._state['x'] + world_dx,
+                        self._state['y'] + world_dy,
+                        self._state['z'] + body_dz)
+        return target_world, self._state['yaw']
+
     def transit_gate(self):
-        """Push straight forward for TRANSIT_TIME to clear the gate."""
-        print('  [TRANSIT] flying through gate')
-        t_end = time.time() + TRANSIT_TIME
-        while time.time() < t_end and not self._stop:
-            self._hover(vx=TRANSIT_VX, z=CRUISE_ALT)
-            time.sleep(0.05)
-        print('  [TRANSIT] done')
+        """
+        Closed-loop transit using gate-height-based pose estimation.
+
+        Latches a waypoint 30 cm past the gate centre along its outward
+        normal on the first good detection, then drives there with small
+        position-setpoint steps. Closed-loop on Lighthouse, so yaw drift
+        cannot curve the path. Falls back to the original blind forward
+        push if no PnP estimate is obtained within PNP_GRACE_S.
+        """
+        from cv_detection import detect_gate, K, DIST
+
+        GATE_HEIGHT_M = 0.40
+        PAST_OFFSET_M = 0.30
+        STEP_M        = 0.05
+        RATE_HZ       = 10.0
+        REACH_TOL_M   = 0.10
+        PNP_GRACE_S   = 1.0
+        TIMEOUT_S     = 6.0
+
+        fy = K[1, 1]
+        dt = 1.0 / RATE_HZ
+
+        print('  [TRANSIT] closed-loop transit (40cm gate, 30cm past)')
+
+        target_world    = None
+        latched_yaw_deg = self._state['yaw']
+        t0 = time.time()
+
+        while time.time() - t0 < TIMEOUT_S and not self._stop:
+            if target_world is None:
+                frame = self._cam.latest_frame
+                if frame is not None:
+                    gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                            if frame.ndim == 3 else frame)
+                    res = detect_gate(gray)
+                    quad = res.get('quad_pix')
+                    if quad is not None:
+                        tw, yw = self._compute_past_gate_waypoint(
+                            quad, K, DIST, fy, GATE_HEIGHT_M, PAST_OFFSET_M)
+                        if tw is not None:
+                            target_world    = tw
+                            latched_yaw_deg = yw
+                            print(f'  [TRANSIT] PnP locked → '
+                                  f'target=({tw[0]:+.2f}, {tw[1]:+.2f}, {tw[2]:.2f})')
+
+            if target_world is None:
+                if time.time() - t0 > PNP_GRACE_S:
+                    print('  [TRANSIT] no PnP — falling back to blind push')
+                    t_end = time.time() + TRANSIT_TIME
+                    while time.time() < t_end and not self._stop:
+                        self._hover(vx=TRANSIT_VX, z=CRUISE_ALT)
+                        time.sleep(0.05)
+                    return
+                self._hover(z=CRUISE_ALT)
+                time.sleep(dt)
+                continue
+
+            tx, ty, tz = target_world
+            dx = tx - self._state['x']
+            dy = ty - self._state['y']
+            dz = tz - self._state['z']
+            dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+            if dist < REACH_TOL_M:
+                print('  [TRANSIT] past-gate waypoint reached')
+                return
+            f = min(1.0, STEP_M / dist)
+            sx = self._state['x'] + f * dx
+            sy = self._state['y'] + f * dy
+            sz = self._state['z'] + f * dz
+            self._cf.commander.send_position_setpoint(sx, sy, sz, latched_yaw_deg)
+            time.sleep(dt)
+
+        print('  [TRANSIT] done (timeout or stop)')
 
     # ── mission: Part 1 — vision ─────────────────────────────────────────────
 
