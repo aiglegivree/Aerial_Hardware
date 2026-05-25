@@ -105,6 +105,10 @@ TRIANGULATE_SKEW_MAX = 0.30   # m
 GATE_RANGE_MIN       = 0.2    # m, min distance from baseline midpoint to gate
 GATE_RANGE_MAX       = 6.0    # m, max distance
 
+# Vertical bias applied to the triangulated gate centre: single-ray
+# triangulation consistently underestimates Z, so we lift the waypoint.
+GATE_Z_OFFSET        = 0.15   # m
+
 SIZE_RATIO_MIN          = 0.5
 SIZE_RATIO_MAX          = 2.0
 
@@ -533,7 +537,7 @@ class GateController:
         gate_yaw = math.atan2(-approach_dir[1], -approach_dir[0])
 
         self._gate_yaw = gate_yaw
-        self._gate_z   = H[2]
+        self._gate_z   = H[2] + GATE_Z_OFFSET
         fw = np.array([math.cos(gate_yaw), math.sin(gate_yaw)])
 
         self._app_x,  self._app_y  = _clamp_to_arena(H[0] - APPROACH_DIST * fw[0],
