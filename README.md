@@ -2,9 +2,9 @@
 
 ## Crazyflie Flight Tests
 
-[Code](myassignement/hardware_lap1.py) · [Onboard recording](myassignement/camera_recording_20260505_153023.mp4) · [Demo](https://aiglegivree.github.io/evanayoub/assets/projects/aerial/video2.mp4)
+[Code](myassignement/hardware_lap1.py) · [Onboard recording](myassignement/camera_recording_20260505_153023.mp4)
 
-[EPFL MICRO-502 flight team](https://github.com/aiglegivree/Aerial_Hardware/commits/master/myassignement/) · [Bitcraze library](https://github.com/bitcraze/crazyflie-lib-python)
+EPFL MICRO-502 flight team · Based on the Bitcraze Crazyflie Python library
 
 `cflib` is a Python library for communicating with and controlling Crazyflie quadcopters, 
 including the Crazyflie 2.1(+), Crazyflie 2.1 Brushless, and 
